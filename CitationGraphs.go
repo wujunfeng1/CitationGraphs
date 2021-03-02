@@ -7,8 +7,12 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+
+	"github.com/wujunfeng1/KeyphraseExtraction"
 )
 
 var reUnicodeHex *regexp.Regexp
@@ -420,4 +424,408 @@ func SaveCitationGraph(path string, prefix string, citationGraph *CitationGraph)
 			fileOfLabels.WriteString(fmt.Sprintf("%d, %s\n", id, label))
 		}
 	}
+}
+
+/*
+# =================================================================================================
+# method TFIDF
+# brief description: compute the TFIDF of possible key phrases for each main node of a citationGraph
+# input:
+# 	nothing
+# output:
+#	the result of TFIDF grouped by the main nodes of the CitationGraph
+*/
+func (g *CitationGraph) TFIDF() []map[string]float64 {
+	candidateTFGroups := []map[string]uint{}
+	phraseCandidateGroups := [][]string{}
+
+	for _, id := range g.ToBeAnalyzed {
+		// get phrase candidates
+		node := g.Nodes[id]
+		phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
+
+		// collect a list of auxiliary phrases
+		auxPhrases := []string{}
+		for _, refID := range node.Refs {
+			refPhrases := KeyphraseExtraction.ExtractKeyPhraseCandidates(g.Nodes[refID].Title)
+			for _, phrase := range refPhrases {
+				auxPhrases = append(auxPhrases, phrase)
+			}
+		}
+
+		// compute TF
+		candidateTFGroups = append(candidateTFGroups, KeyphraseExtraction.TF(phraseCandidates, auxPhrases))
+
+		// append this group of phraseCandidates to the candidate groups
+		phraseCandidateGroups = append(phraseCandidateGroups, phraseCandidates)
+	}
+
+	// compute IDF
+	IDFs := KeyphraseExtraction.IDF(phraseCandidateGroups)
+
+	// TFIDF = TF * IDF
+	result := []map[string]float64{}
+	for _, candidateTFs := range candidateTFGroups {
+		groupResult := map[string]float64{}
+		for text, tf := range candidateTFs {
+			idf, exists := IDFs[text]
+			if !exists {
+				log.Fatal(fmt.Sprintf("phrase %s not found in IDFs", text))
+			}
+			groupResult[text] = float64(tf) * idf
+		}
+		result = append(result, groupResult)
+	}
+
+	// return the result
+	return result
+}
+
+/*
+# =================================================================================================
+# method GetPhraseSimilarity
+# brief description: compute the similarities between pairs of phrases and gives them in form of a
+#	sparse matrix
+# input:
+# 	nothing
+# output:
+#	the sparse matrix of phrase similarities
+*/
+func (g *CitationGraph) GetPhraseSimilarity() map[string]map[string]float64 {
+	// --------------------------------------------------------------------------------------------
+	// step 1: count the phrase-pair frequencies
+	pairFreq := map[string]map[string]uint{}
+	numCPUs := runtime.NumCPU()
+	chNodes := make(chan []*CitationNode)
+	chWorkers := make(chan bool)
+	lock := sync.RWMutex{}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func(idxWorker int) {
+			// store my results in myPairFreq first, merge my results into pairFreq later
+			myPairFreq := map[string]map[string]uint{}
+			numProcessedNodes := 0
+			for nodes := <-chNodes; len(nodes) > 0; nodes = <-chNodes {
+				for _, node := range nodes {
+					// get phrase candidates
+					phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
+
+					// split candidates
+					wordss := [][]string{}
+					for _, candid := range phraseCandidates {
+						words := strings.Split(candid, " ")
+						wordss = append(wordss, words)
+					}
+
+					// count pair frequency
+					for idx1, words1 := range wordss {
+						n1 := len(words1)
+						for idx2, words2 := range wordss {
+							if idx2 == idx1 {
+								continue
+							}
+							n2 := len(words2)
+							for i1 := 0; i1 < n1; i1++ {
+								text1 := words1[i1]
+								row, exists := myPairFreq[text1]
+								if !exists {
+									row = map[string]uint{}
+									myPairFreq[text1] = row
+								}
+								for i2 := 0; i2 < n2; i2++ {
+									text2 := words2[i2]
+									oldFreq, exists := row[text2]
+									if !exists {
+										oldFreq = 0
+									}
+									row[text2] = oldFreq + 1
+									for j2 := i2 + 1; j2 < n2; j2++ {
+										text2 += " " + words2[j2]
+										oldFreq, exists = row[text2]
+										if !exists {
+											oldFreq = 0
+										}
+										row[text2] = oldFreq + 1
+									}
+								}
+								for j1 := i1 + 1; j1 < n1; j1++ {
+									text1 += " " + words1[j1]
+									row, exists = myPairFreq[text1]
+									if !exists {
+										row = map[string]uint{}
+										myPairFreq[text1] = row
+									}
+									for i2 := 0; i2 < n2; i2++ {
+										text2 := words2[i2]
+										oldFreq, exists := row[text2]
+										if !exists {
+											oldFreq = 0
+										}
+										row[text2] = oldFreq + 1
+										for j2 := i2 + 1; j2 < n2; j2++ {
+											text2 += " " + words2[j2]
+											oldFreq, exists = row[text2]
+											if !exists {
+												oldFreq = 0
+											}
+											row[text2] = oldFreq + 1
+										}
+									}
+								}
+							}
+						}
+					}
+
+				}
+				numProcessedNodes += len(nodes)
+				fmt.Printf("worker %d has processed %d nodes\n", idxWorker, numProcessedNodes)
+			}
+
+			// now we merge the results into pairFreq
+			// fmt.Printf("worker %d is merging results\n", idxWorker)
+			lock.Lock()
+			defer lock.Unlock()
+			for key1, value1 := range myPairFreq {
+				row, exists := pairFreq[key1]
+				if !exists {
+					pairFreq[key1] = value1
+				} else {
+					for key2, value2 := range value1 {
+						oldValue, exists := row[key2]
+						if !exists {
+							oldValue = uint(0)
+						}
+						row[key2] = oldValue + value2
+					}
+				}
+			}
+			fmt.Printf("worker %d exits\n", idxWorker)
+			chWorkers <- true
+		}(idxCPU)
+	}
+
+	nodeBatch := make([]*CitationNode, 3000)
+	idxInBatch := 0
+	for _, node := range g.Nodes {
+		nodeBatch[idxInBatch] = node
+		idxInBatch++
+		if idxInBatch == len(nodeBatch) {
+			chNodes <- nodeBatch
+			nodeBatch = make([]*CitationNode, 3000)
+			idxInBatch = 0
+		}
+	}
+	if idxInBatch > 0 {
+		nodeBatch = nodeBatch[:idxInBatch]
+		chNodes <- nodeBatch
+	}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		chNodes <- []*CitationNode{}
+	}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+	fmt.Println("pair frequencies counted")
+
+	// --------------------------------------------------------------------------------------------
+	// step 2: compute conditional probability
+	condProb := map[string]map[string]float64{}
+	chKeys := make(chan []string)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func(idxWorker int) {
+			numProcessedKeys := 0
+			myRows := map[string]map[string]float64{}
+			for keys := <-chKeys; len(keys) > 0; keys = <-chKeys {
+				for _, text1 := range keys {
+					rowFreq, _ := pairFreq[text1]
+					sumRowFreq := 0.0
+					for _, freq := range rowFreq {
+						sumRowFreq += float64(freq)
+					}
+					rowCondProb := map[string]float64{}
+					for text2, freq := range rowFreq {
+						rowCondProb[text2] = float64(freq) / sumRowFreq
+					}
+					myRows[text1] = rowCondProb
+				}
+				numProcessedKeys += len(keys)
+				fmt.Printf("worker %d has processed %d keys\n", idxWorker, numProcessedKeys)
+			}
+			lock.Lock()
+			defer lock.Unlock()
+			for key, row := range myRows {
+				condProb[key] = row
+			}
+			fmt.Printf("worker %d exits\n", idxWorker)
+			chWorkers <- true
+		}(idxCPU)
+	}
+
+	keyBatch := make([]string, 10000)
+	idxInBatch = 0
+	for key, _ := range pairFreq {
+		keyBatch[idxInBatch] = key
+		idxInBatch++
+		if idxInBatch == len(keyBatch) {
+			chKeys <- keyBatch
+			keyBatch = make([]string, 10000)
+			idxInBatch = 0
+		}
+	}
+	if idxInBatch > 0 {
+		keyBatch = keyBatch[:idxInBatch]
+		chKeys <- keyBatch
+	}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		chKeys <- []string{}
+	}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+	fmt.Println("conditional probabilities computed")
+
+	// --------------------------------------------------------------------------------------------
+	// step 3: compute the result
+	result := map[string]map[string]float64{}
+	for text1, row := range condProb {
+		result[text1] = map[string]float64{}
+		for text2, p := range row {
+			result[text1][text2] = 0.5 * p
+		}
+	}
+	for text1, row := range condProb {
+		for text2, p := range row {
+			result[text2][text1] += 0.5 * p
+		}
+	}
+	// must force the diagonals to be 1.0
+	for text, row := range result {
+		row[text] = 1.0
+	}
+	return result
+}
+
+/*
+# =================================================================================================
+# method SimTFIDF
+# brief description: compute the Fuzzy TFIDF of possible key phrases for each main node of a citationGraph
+# input:
+# 	nothing
+# output:
+#	the result of Fuzzy TFIDF grouped by the main nodes of the CitationGraph
+*/
+func (g *CitationGraph) SimTFIDF() []map[string]float64 {
+	candidateTFGroups := []map[string]float64{}
+	phraseCandidateGroups := [][]string{}
+	phraseSimilarity := g.GetPhraseSimilarity()
+	fmt.Println("similarity generated")
+
+	for idxID, id := range g.ToBeAnalyzed {
+		// get phrase candidates
+		node := g.Nodes[id]
+		phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
+
+		// collect a list of auxiliary phrases
+		auxPhrases := []string{}
+		for _, refID := range node.Refs {
+			refPhrases := KeyphraseExtraction.ExtractKeyPhraseCandidates(g.Nodes[refID].Title)
+			for _, phrase := range refPhrases {
+				auxPhrases = append(auxPhrases, phrase)
+			}
+		}
+
+		// compute Fuzzy TF
+		candidateTFGroups = append(candidateTFGroups, KeyphraseExtraction.SimTF(phraseCandidates, auxPhrases, phraseSimilarity))
+
+		// append this group of phraseCandidates to the candidate groups
+		phraseCandidateGroups = append(phraseCandidateGroups, phraseCandidates)
+
+		if (idxID+1)%1000 == 0 {
+			fmt.Printf("%d of %d sim TF computed\n", idxID+1, len(g.ToBeAnalyzed))
+		}
+	}
+	fmt.Println("All sim TF computed")
+
+	// compute IDF
+	IDFs := KeyphraseExtraction.IDF(phraseCandidateGroups)
+	fmt.Println(("sim IDF computed"))
+
+	// TFIDF = TF * IDF
+	result := []map[string]float64{}
+	for _, candidateTFs := range candidateTFGroups {
+		groupResult := map[string]float64{}
+		for text, tf := range candidateTFs {
+			idf, exists := IDFs[text]
+			if !exists {
+				log.Fatal(fmt.Sprintf("phrase %s not found in IDFs", text))
+			}
+			groupResult[text] = float64(tf) * idf
+		}
+		result = append(result, groupResult)
+	}
+
+	// return the result
+	return result
+}
+
+/*
+# =================================================================================================
+# method SimTFSimIDF
+# brief description: compute the Fuzzy TFIDF of possible key phrases for each main node of a citationGraph
+# input:
+# 	nothing
+# output:
+#	the result of Fuzzy TFIDF grouped by the main nodes of the CitationGraph
+*/
+func (g *CitationGraph) SimTFSimIDF() []map[string]float64 {
+	candidateTFGroups := []map[string]float64{}
+	phraseCandidateGroups := [][]string{}
+	phraseSimilarity := g.GetPhraseSimilarity()
+	fmt.Println("similarity generated")
+
+	for idxID, id := range g.ToBeAnalyzed {
+		// get phrase candidates
+		node := g.Nodes[id]
+		phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
+
+		// collect a list of auxiliary phrases
+		auxPhrases := []string{}
+		for _, refID := range node.Refs {
+			refPhrases := KeyphraseExtraction.ExtractKeyPhraseCandidates(g.Nodes[refID].Title)
+			for _, phrase := range refPhrases {
+				auxPhrases = append(auxPhrases, phrase)
+			}
+		}
+
+		// compute Fuzzy TF
+		candidateTFGroups = append(candidateTFGroups, KeyphraseExtraction.SimTF(phraseCandidates, auxPhrases, phraseSimilarity))
+
+		// append this group of phraseCandidates to the candidate groups
+		phraseCandidateGroups = append(phraseCandidateGroups, phraseCandidates)
+
+		if (idxID+1)%1000 == 0 {
+			fmt.Printf("%d of %d sim TF computed\n", idxID+1, len(g.ToBeAnalyzed))
+		}
+	}
+	fmt.Println("All sim TF computed")
+
+	// compute IDF
+	IDFs := KeyphraseExtraction.SimIDF(phraseCandidateGroups, phraseSimilarity)
+	fmt.Println(("All sim IDF computed"))
+
+	// TFIDF = TF * IDF
+	result := []map[string]float64{}
+	for _, candidateTFs := range candidateTFGroups {
+		groupResult := map[string]float64{}
+		for text, tf := range candidateTFs {
+			idf, exists := IDFs[text]
+			if !exists {
+				log.Fatal(fmt.Sprintf("phrase %s not found in IDFs", text))
+			}
+			groupResult[text] = float64(tf) * idf
+		}
+		result = append(result, groupResult)
+	}
+
+	// return the result
+	return result
 }
