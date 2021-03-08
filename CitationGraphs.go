@@ -1245,8 +1245,8 @@ func (g *CitationGraph) ClusterByLDA(numTopics int, alpha, beta float32, numIter
 					// (2.2) extract all possible phrases in title and put them in the phrase list
 					phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
 					for _, candidate := range phraseCandidates {
-						candidatePhrases := KeyphraseExtraction.GetAllPossiblePhrases(candidate)
-						for _, phrase := range candidatePhrases {
+						candidateWords := strings.Split(candidate, " ")
+						for _, phrase := range candidateWords {
 							phrases = append(phrases, phrase)
 						}
 					}
