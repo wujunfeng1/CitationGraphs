@@ -114,13 +114,15 @@ func (this *Corpus) AddDoc(words []string) {
 // =================================================================================================
 // interface LDAModel
 // brief description: the common interface of LDA models
-type LDAModel interface {
+type TopicModel interface {
 	// train model for iter iteration
 	Train(numIters int)
 	// do inference for new doc with its wordCounts
-	Infer(words []string) []float32
+	Infer(words []string) []float64
 	// compute entropy
 	ComputeEntropy() float64
+	// compute relative entropy
+	ComputeRelativeEntropy() float64
 }
 
 // =================================================================================================
@@ -131,17 +133,17 @@ type DocWord struct {
 }
 
 // =================================================================================================
-// struct CGSLDA
+// struct LDA
 // brief description: the data structure of LDA model with Collapsed Gibbs Sampler
 // note:
 //	The fast collapsed gibbs sampler algorithm can be found in reference:
 //	Porteous, I., Newman, D., Ihler, A., Asuncion, A., Smyth, P., & Welling, M. (2008, August). Fast
 //	collapsed gibbs sampling for latent dirichlet allocation. In Proceedings of the 14th ACM SIGKDD
 //	international conference on Knowledge discovery and data mining (pp. 569-577).
-type CGSLDA struct {
-	Alpha     float32 // document topic mixture hyperparameter
-	Beta      float32 // topic word mixture hyperparameter
-	numTopics int     // number of topics
+type LDA struct {
+	Alpha     float64 // document topic mixture hyperparameter
+	Beta      float64 // topic word mixture hyperparameter
+	NumTopics int     // number of topics
 
 	Data *Corpus // the input corpus
 
@@ -152,9 +154,9 @@ type CGSLDA struct {
 }
 
 // =================================================================================================
-// func NewCGSLDA
+// func NewLDA
 // brief description: create an LDA instance with collapsed gibbs sampler
-func NewCGSLDA(numTopics int, alpha float32, beta float32, data *Corpus) *CGSLDA {
+func NewLDA(numTopics int, alpha float64, beta float64, data *Corpus) *LDA {
 	// ---------------------------------------------------------------------------------------------
 	// step 1: check parameters
 	if data == nil {
@@ -200,10 +202,10 @@ func NewCGSLDA(numTopics int, alpha float32, beta float32, data *Corpus) *CGSLDA
 
 	// ---------------------------------------------------------------------------------------------
 	// step 6: assemble the result
-	result := &CGSLDA{
+	result := &LDA{
 		Alpha:     alpha,
 		Beta:      beta,
-		numTopics: numTopics,
+		NumTopics: numTopics,
 		Data:      data,
 
 		WordTopicCount: wordTopicCount,
@@ -218,11 +220,11 @@ func NewCGSLDA(numTopics int, alpha float32, beta float32, data *Corpus) *CGSLDA
 }
 
 // =================================================================================================
-// func (this *CGSLDA) updateCounters
-func (this *CGSLDA) updateCounters() {
+// func (this *LDA) updateCounters
+func (this *LDA) updateCounters() {
 	// ---------------------------------------------------------------------------------------------
 	// step 1: initialize Counters
-	numTopics := this.numTopics
+	numTopics := this.NumTopics
 	for idxTopic := 0; idxTopic < numTopics; idxTopic++ {
 		this.TopicCountSum[idxTopic] = 0
 	}
@@ -266,8 +268,8 @@ func (this *CGSLDA) updateCounters() {
 }
 
 // =================================================================================================
-// func (this *CGSLDA) Init
-func (this *CGSLDA) Init() {
+// func (this *LDA) Init
+func (this *LDA) Init() {
 	// ---------------------------------------------------------------------------------------------
 	// step 1: randomly assign topic to word
 	for doc, wordCounts := range this.Data.Docs {
@@ -275,7 +277,7 @@ func (this *CGSLDA) Init() {
 			toTopic := this.DocWordToTopic[DocWord{doc, w}]
 			for i := 0; i < count; i++ {
 				// sample word topic
-				k := rand.Intn(this.numTopics)
+				k := rand.Intn(this.NumTopics)
 
 				// record the topic assignment
 				toTopic[i] = k
@@ -289,14 +291,31 @@ func (this *CGSLDA) Init() {
 }
 
 // =================================================================================================
-// func (this *CGSLDA) ResampleTopics
-func (this *CGSLDA) ResampleTopics(numIters int) {
+// func (this *LDA) probTopicOfDocWord
+func (this *LDA) probTopicOfDocWord(doc int, w int, k int, idxK int) float64 {
+	numWords := float64(len(this.Data.Vocab))
+	myDocTopicCount := float64(this.DocTopicCount[doc][idxK])
+	myWordTopicCount := float64(this.WordTopicCount[w][idxK])
+	myTopicCountSum := float64(this.TopicCountSum[idxK])
+	if idxK == k {
+		myDocTopicCount--
+		myWordTopicCount--
+		myTopicCountSum--
+	}
+
+	docPart := this.Alpha + myDocTopicCount
+	wordPart := (this.Beta + myWordTopicCount) / (this.Beta*numWords + myTopicCountSum)
+	return docPart * wordPart
+}
+
+// =================================================================================================
+// func (this *LDA) ResampleTopics
+func (this *LDA) ResampleTopics(numIters int) {
 	// ---------------------------------------------------------------------------------------------
 	// step 1: resample topics in parallel
 	numCPUs := runtime.NumCPU()
-	numWords := len(this.Data.Vocab)
 	for idxIter := 0; idxIter < numIters; idxIter++ {
-		log.Printf("iter %5d, entropy %f", idxIter, this.ComputeEntropy())
+		log.Printf("iter %5d, relative entropy %f", idxIter, this.ComputeRelativeEntropy())
 
 		// (1.1) create channels for input and output
 		chDocs := make(chan []int)
@@ -305,7 +324,7 @@ func (this *CGSLDA) ResampleTopics(numIters int) {
 		// (1.2) create goroutines for resampling
 		for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
 			go func() {
-				prefixSum := make([]float32, this.numTopics)
+				prefixSum := make([]float64, this.NumTopics)
 				for docs := range chDocs {
 					for doc := range docs {
 						wordCounts := this.Data.Docs[doc]
@@ -316,29 +335,18 @@ func (this *CGSLDA) ResampleTopics(numIters int) {
 								k := toTopic[i]
 
 								// (1.2.1) compute resampling probabilities
-								for idxK := 0; idxK < this.numTopics; idxK += 1 {
-									myDocTopicCount := float32(this.DocTopicCount[doc][idxK])
-									myWordTopicCount := float32(this.WordTopicCount[w][idxK])
-									myTopicCountSum := float32(this.TopicCountSum[idxK])
-									if idxK == k {
-										myDocTopicCount--
-										myWordTopicCount--
-										myTopicCountSum--
-									}
-
-									docPart := this.Alpha + myDocTopicCount
-									wordPart := (this.Beta + myWordTopicCount) /
-										(this.Beta*float32(numWords) + myTopicCountSum)
+								for idxK := 0; idxK < this.NumTopics; idxK += 1 {
+									prob := this.probTopicOfDocWord(doc, w, k, idxK)
 									if idxK == 0 {
-										prefixSum[idxK] = docPart * wordPart
+										prefixSum[idxK] = prob
 									} else {
-										prefixSum[idxK] = prefixSum[idxK-1] + docPart*wordPart
+										prefixSum[idxK] = prefixSum[idxK-1] + prob
 									}
 								}
 
 								// (1.2.2) use resampling probabilities to resample topic
-								u := rand.Float32() * prefixSum[this.numTopics-1]
-								for idxK := 0; idxK < this.numTopics; idxK++ {
+								u := rand.Float64() * prefixSum[this.NumTopics-1]
+								for idxK := 0; idxK < this.NumTopics; idxK++ {
 									if u < prefixSum[idxK] {
 										k = idxK
 										break
@@ -380,13 +388,13 @@ func (this *CGSLDA) ResampleTopics(numIters int) {
 	}
 
 	// step 2: report entropy
-	log.Printf("final entropy %f", this.ComputeEntropy())
+	log.Printf("final relative entropy %f", this.ComputeRelativeEntropy())
 }
 
 // =================================================================================================
-// func (this *CGSLDA) Train
+// func (this *LDA) Train
 // brief description: train model
-func (this *CGSLDA) Train(numIters int) {
+func (this *LDA) Train(numIters int) {
 	// randomly init
 	this.Init()
 
@@ -395,9 +403,9 @@ func (this *CGSLDA) Train(numIters int) {
 }
 
 // =================================================================================================
-// func (this *CGSLDA) Infer
+// func (this *LDA) Infer
 // brief description: infer topics on new documents
-func (this *CGSLDA) Infer(words []string) []float32 {
+func (this *LDA) Infer(words []string) []float64 {
 	// ---------------------------------------------------------------------------------------------
 	// step 1: convert words to word counts
 	wordCounts := map[int]int{}
@@ -414,16 +422,16 @@ func (this *CGSLDA) Infer(words []string) []float32 {
 
 	// ---------------------------------------------------------------------------------------------
 	// step 2: compute unscaled probabilities
-	probs := make([]float32, this.numTopics)
-	sumProbs := float32(0.0)
+	probs := make([]float64, this.NumTopics)
+	sumProbs := float64(0.0)
 	numWords := len(this.Data.Vocab)
-	for idxK := 0; idxK < this.numTopics; idxK++ {
-		myProb := float32(0.0)
+	for idxK := 0; idxK < this.NumTopics; idxK++ {
+		myProb := float64(0.0)
 		for w, count := range wordCounts {
-			myWordTopicCount := float32(this.WordTopicCount[w][idxK])
-			myTopicCountSum := float32(this.TopicCountSum[idxK])
-			myProb += float32(count) * (this.Beta + myWordTopicCount) /
-				(this.Beta*float32(numWords) + myTopicCountSum)
+			myWordTopicCount := float64(this.WordTopicCount[w][idxK])
+			myTopicCountSum := float64(this.TopicCountSum[idxK])
+			myProb += float64(count) * (this.Beta + myWordTopicCount) /
+				(this.Beta*float64(numWords) + myTopicCountSum)
 		}
 		sumProbs += myProb
 		probs[idxK] = myProb
@@ -434,7 +442,7 @@ func (this *CGSLDA) Infer(words []string) []float32 {
 	if sumProbs == 0.0 {
 		sumProbs = 1.0
 	}
-	for idxK := 0; idxK < this.numTopics; idxK++ {
+	for idxK := 0; idxK < this.NumTopics; idxK++ {
 		probs[idxK] /= sumProbs
 	}
 
@@ -444,19 +452,19 @@ func (this *CGSLDA) Infer(words []string) []float32 {
 }
 
 // =================================================================================================
-// func (this *CGSLDA) ComputeEntropy
+// func (this *LDA) ComputeEntropy
 // brief description: compute entropy
-func (this *CGSLDA) ComputeEntropy() float64 {
+func (this *LDA) ComputeEntropy() float64 {
 	entropy := 0.0
 	sumCount := 0
 	for doc, _ := range this.Data.Docs {
 		myTopicCount := this.DocTopicCount[doc]
 		mySumCount := 0
-		for k := 0; k < this.numTopics; k++ {
+		for k := 0; k < this.NumTopics; k++ {
 			mySumCount += myTopicCount[k]
 		}
 		myEntropy := 0.0
-		for k := 0; k < this.numTopics; k++ {
+		for k := 0; k < this.NumTopics; k++ {
 			if myTopicCount[k] > 0 {
 				myP := float64(myTopicCount[k]) / float64(mySumCount)
 				myEntropy -= myP * math.Log(myP)
@@ -467,6 +475,15 @@ func (this *CGSLDA) ComputeEntropy() float64 {
 	}
 	entropy /= float64(sumCount)
 	return entropy
+}
+
+// =================================================================================================
+// func (this *LDA) ComputeEntropy
+// brief description: compute entropy
+func (this *LDA) ComputeRelativeEntropy() float64 {
+	entropy := this.ComputeEntropy()
+	maxEntropy := -math.Log(1.0 / float64(this.NumTopics))
+	return entropy / maxEntropy
 }
 
 // =================================================================================================
@@ -705,6 +722,354 @@ func LoadCitationGraph(path string, prefix string) *CitationGraph {
 	// --------------------------------------------------------------------------------------
 	// step 6: Return the result
 	return result
+}
+
+// =================================================================================================
+// struct GSDMM
+// brief description: the data structure of GSDMM model
+type GSDMM struct {
+	Alpha     float64 // document topic mixture hyperparameter
+	Beta      float64 // topic word mixture hyperparameter
+	NumTopics int     // number of topics
+
+	Data          *Corpus // the input corpus
+	NumWordsInDoc []int   // the number of words in documents
+
+	DocTopic          []int   // doc-topic count table
+	TopicWordCount    [][]int // word-topic count table
+	TopicWordCountSum []int   // word-topic-sum count table
+	TopicDocCount     []int   // topic-doc-sum count table
+}
+
+// =================================================================================================
+// func NewGSDMM
+// brief description: create an LDA instance with collapsed gibbs sampler
+func NewGSDMM(numTopics int, alpha float64, beta float64, data *Corpus) *GSDMM {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: check parameters
+	if data == nil {
+		log.Fatalln("corpus is nil")
+	}
+
+	if numTopics <= 0 {
+		log.Fatalln("numTopics cannot <= 0.")
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: create docTopic
+	numDocs := len(data.Docs)
+	docTopic := make([]int, numDocs)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: create topicWordCount
+	numWords := len(data.Vocab)
+	topicWordCount := make([][]int, numTopics)
+	for k := 0; k < numTopics; k++ {
+		topicWordCount[k] = make([]int, numWords)
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: create topicWordCountSum
+	topicWordCountSum := make([]int, numTopics)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: create topicDocCount
+	topicDocCount := make([]int, numTopics)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 6: create NumWordsInDoc
+	numWordsInDoc := make([]int, numDocs)
+	for doc, wordCounts := range data.Docs {
+		numWordsInDoc[doc] = 0
+		for _, count := range wordCounts {
+			numWordsInDoc[doc] += count
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 7: assemble the result
+	result := &GSDMM{
+		Alpha:         alpha,
+		Beta:          beta,
+		NumTopics:     numTopics,
+		Data:          data,
+		NumWordsInDoc: numWordsInDoc,
+
+		DocTopic:          docTopic,
+		TopicWordCount:    topicWordCount,
+		TopicWordCountSum: topicWordCountSum,
+		TopicDocCount:     topicDocCount,
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 8: return the result
+	return result
+}
+
+// =================================================================================================
+// func (this *GSDMM) updateCounters
+func (this *GSDMM) updateCounters() {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: initialize Counters
+	numTopics := this.NumTopics
+	numWords := len(this.Data.Vocab)
+	for idxTopic := 0; idxTopic < numTopics; idxTopic++ {
+		this.TopicWordCountSum[idxTopic] = 0
+		this.TopicDocCount[idxTopic] = 0
+		wordCountOfTopic := this.TopicWordCount[idxTopic]
+		for w := 0; w < numWords; w++ {
+			wordCountOfTopic[w] = 0
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: count them!
+	for doc, wordCounts := range this.Data.Docs {
+		k := this.DocTopic[doc]
+		this.TopicDocCount[k]++
+		for w, count := range wordCounts {
+			this.TopicWordCount[w][k] += count
+			this.TopicWordCountSum[k] += count
+		}
+	}
+}
+
+// =================================================================================================
+// func (this *GSDMM) Init
+func (this *GSDMM) Init() {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: randomly assign topic to doc
+	for doc, _ := range this.Data.Docs {
+		// sample document topic
+		this.DocTopic[doc] = rand.Intn(this.NumTopics)
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: update counters
+	this.updateCounters()
+}
+
+// =================================================================================================
+// func (this *GSDMM) probTopicOfDoc
+func (this *GSDMM) probTopicOfDoc(doc int, k int, idxK int) float64 {
+	numTopics := float64(len(this.Data.Docs))
+	docCountOfTopic := float64(this.TopicDocCount[idxK])
+	if idxK == k {
+		docCountOfTopic--
+	}
+	docPart := (docCountOfTopic + this.Alpha) / (docCountOfTopic - 1.0 + this.Alpha*numTopics)
+
+	topicWordCountSum := float64(this.TopicWordCountSum[idxK])
+	wordCounts := this.Data.Docs[doc]
+	if idxK == k {
+		topicWordCountSum -= float64(this.NumWordsInDoc[doc])
+	}
+
+	numWords := float64(len(this.Data.Vocab))
+	idxWordInDoc := 0
+	wordPart := 1.0
+	for w, count := range wordCounts {
+		wordCountOfTopic := float64(this.TopicWordCount[idxK][w])
+		if idxK == k {
+			wordCountOfTopic -= float64(count)
+		}
+		for j := 0; j < count; j++ {
+			wordPart *= (wordCountOfTopic + this.Beta + float64(j)) / (topicWordCountSum +
+				this.Beta*numWords + float64(idxWordInDoc))
+			idxWordInDoc++
+		}
+	}
+
+	return docPart * wordPart
+}
+
+// =================================================================================================
+// func (this *GSDMM) ResampleTopics
+func (this *GSDMM) ResampleTopics(numIters int) {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: resample topics in parallel
+	numCPUs := runtime.NumCPU()
+	for idxIter := 0; idxIter < numIters; idxIter++ {
+		log.Printf("iter %5d, relative entropy %f", idxIter, this.ComputeRelativeEntropy())
+
+		// (1.1) create channels for input and output
+		chDocs := make(chan []int)
+		chWorkers := make(chan bool)
+
+		// (1.2) create goroutines for resampling
+		for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+			go func() {
+				prefixSum := make([]float64, this.NumTopics)
+				for docs := range chDocs {
+					for doc := range docs {
+						// (1.2.1) compute resampling probabilities
+						k := this.DocTopic[doc]
+						for idxK := 0; idxK < this.NumTopics; idxK++ {
+							prob := this.probTopicOfDoc(doc, k, idxK)
+							if idxK == 0 {
+								prefixSum[idxK] = prob
+							} else {
+								prefixSum[idxK] = prefixSum[idxK-1] + prob
+							}
+						}
+
+						// (1.2.2) use resampling probabilities to resample topic
+						u := rand.Float64() * prefixSum[this.NumTopics-1]
+						for idxK := 0; idxK < this.NumTopics; idxK++ {
+							if u < prefixSum[idxK] {
+								k = idxK
+								break
+							}
+						}
+
+						// (1.2.3) record the new topic
+						this.DocTopic[doc] = k
+					}
+				}
+				chWorkers <- true
+			}()
+		}
+
+		// (1.3) generate inputs
+		numDocs := len(this.Data.Docs)
+		for doc := 0; doc < numDocs; doc += 100 {
+			lenDocs := 100
+			if doc+lenDocs > numDocs {
+				lenDocs = numDocs - doc
+			}
+			docs := make([]int, lenDocs)
+			for i := 0; i < lenDocs; i++ {
+				docs[i] = doc + i
+			}
+			chDocs <- docs
+		}
+		close(chDocs)
+
+		// (1.4) wait for all workers to complete their jobs
+		for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+			<-chWorkers
+		}
+
+		// (1.5) update the counters
+		this.updateCounters()
+	}
+
+	// step 2: report entropy
+	log.Printf("final relative entropy %f", this.ComputeRelativeEntropy())
+}
+
+// =================================================================================================
+// func (this *GSDMM) Train
+// brief description: train model
+func (this *GSDMM) Train(numIters int) {
+	// randomly init
+	this.Init()
+
+	// resample topics
+	this.ResampleTopics(numIters)
+}
+
+// =================================================================================================
+// func (this *GSDMM) Infer
+// brief description: infer topics on new documents
+func (this *GSDMM) Infer(words []string) []float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: convert words to word counts
+	wordCounts := map[int]int{}
+	for _, word := range words {
+		w, exists := this.Data.Vocab[word]
+		if exists {
+			count, exists := wordCounts[w]
+			if !exists {
+				count = 0
+			}
+			wordCounts[w] = count + 1
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute unscaled probabilities
+	probs := make([]float64, this.NumTopics)
+	sumProbs := float64(0.0)
+	numTopics := float64(len(this.Data.Docs))
+	numWords := float64(len(this.Data.Vocab))
+	for idxK := 0; idxK < this.NumTopics; idxK++ {
+		// -----------------------------------------------------------------------------------------
+		// (2.1) compute doc part of probs
+		docCountOfTopic := float64(this.TopicDocCount[idxK])
+		docPart := (docCountOfTopic + this.Alpha) / (docCountOfTopic - 1.0 + this.Alpha*numTopics)
+
+		// -----------------------------------------------------------------------------------------
+		// (2.2) compute word part of probs
+		topicWordCountSum := float64(this.TopicWordCountSum[idxK])
+		idxWordInDoc := 0
+		wordPart := 1.0
+		for w, count := range wordCounts {
+			wordCountOfTopic := float64(this.TopicWordCount[idxK][w])
+			for j := 0; j < count; j++ {
+				wordPart *= (wordCountOfTopic + this.Beta + float64(j)) / (topicWordCountSum +
+					this.Beta*numWords + float64(idxWordInDoc))
+				idxWordInDoc++
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------
+		// (2.3) assemble myProb
+		myProb := docPart * wordPart
+		sumProbs += myProb
+		probs[idxK] = myProb
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: scale the probs to make their sum == 1.0
+	if sumProbs == 0.0 {
+		sumProbs = 1.0
+	}
+	for idxK := 0; idxK < this.NumTopics; idxK++ {
+		probs[idxK] /= sumProbs
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: return the result
+	return probs
+}
+
+// =================================================================================================
+// func (this *GSDMM) ComputeEntropy
+// brief description: compute entropy
+func (this *GSDMM) ComputeEntropy() float64 {
+	entropy := 0.0
+	numDocs := float64(len(this.Data.Docs))
+	for doc, _ := range this.Data.Docs {
+		k := this.DocTopic[doc]
+
+		myProbs := make([]float64, this.NumTopics)
+		mySumProbs := 0.0
+		for idxK := 0; idxK < this.NumTopics; idxK++ {
+			myProbs[idxK] = this.probTopicOfDoc(doc, k, idxK)
+			mySumProbs += myProbs[idxK]
+		}
+
+		myEntropy := 0.0
+		if mySumProbs > 0.0 {
+			for idxK := 0; idxK < this.NumTopics; idxK++ {
+				myP := myProbs[k] / mySumProbs
+				myEntropy -= myP * math.Log(myP)
+			}
+		}
+
+		entropy += myEntropy / numDocs
+	}
+	return entropy
+}
+
+// =================================================================================================
+// func (this *GSDMM) ComputeEntropy
+// brief description: compute entropy
+func (this *GSDMM) ComputeRelativeEntropy() float64 {
+	entropy := this.ComputeEntropy()
+	maxEntropy := -math.Log(1.0 / float64(this.NumTopics))
+	return entropy / maxEntropy
 }
 
 // ===========================================================================================
@@ -1213,15 +1578,15 @@ func (g *CitationGraph) GetPhraseSimilarityTL() map[string]map[string]float64 {
 // =================================================================================================
 // func (g *CitationGraph) ClusterByLDA
 // brief description: cluster the main nodes of g with their titles and their reference titles using
-//	using CGSLDA.
+//	using LDA.
 // input:
 //	numTopics: number of topics
-//	alpha, beta: the parameters of CGSLDA
+//	alpha, beta: the parameters of LDA
 //	numIters: number of iterations for LDA
 // output:
 //	for each main node, gives the likelihoods the node belonging to a cluster.
-func (g *CitationGraph) ClusterByLDA(numTopics int, alpha, beta float32, numIters int,
-) map[int64][]float32 {
+func (g *CitationGraph) ClusterByLDA(numTopics int, alpha, beta float64, numIters int,
+) map[int64][]float64 {
 	if numTopics <= 0 || alpha <= 0.0 || beta <= 0.0 || numIters <= 0 {
 		log.Fatalln("all parameters of ClusterByLDA must be > 0")
 	}
@@ -1305,12 +1670,12 @@ func (g *CitationGraph) ClusterByLDA(numTopics int, alpha, beta float32, numIter
 
 	// ---------------------------------------------------------------------------------------------
 	// step 5: use the corpus to compute LDA
-	LDA := NewCGSLDA(numTopics, alpha, beta, corpus)
+	LDA := NewLDA(numTopics, alpha, beta, corpus)
 	LDA.Train(numIters)
 
 	// ---------------------------------------------------------------------------------------------
 	// step 6: infer cluster memberships for each node
-	memberships := map[int64][]float32{}
+	memberships := map[int64][]float64{}
 	for nodeID, phrases := range phrasesOfNodes {
 		membershipsOfNode := LDA.Infer(phrases)
 		memberships[nodeID] = membershipsOfNode
