@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wujunfeng1/ConcurrenceBasedClustering"
 	"github.com/wujunfeng1/KeyphraseExtraction"
 )
 
@@ -96,7 +97,7 @@ func (this *Corpus) AddDoc(words []string) {
 	for _, word := range words {
 		wordID, exists := this.Vocab[word]
 		if !exists {
-			wordID := len(this.Vocab)
+			wordID = len(this.Vocab)
 			this.Vocab[word] = wordID
 		}
 		count, exists := doc[wordID]
@@ -112,13 +113,72 @@ func (this *Corpus) AddDoc(words []string) {
 }
 
 // =================================================================================================
+// func (this *Corpus) GetConcurrences
+// brief description: get concurrences from corpus
+func (this *Corpus) GetConcurrences() map[uint]map[uint]float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create concurrences
+	concurrences := map[uint]map[uint]float64{}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: count concurrences when words are in the same document
+	for _, wordCount := range this.Docs {
+		for w1, count1 := range wordCount {
+			concurrencesOfW1, exists := concurrences[uint(w1)]
+			if !exists {
+				concurrencesOfW1 = map[uint]float64{}
+				concurrences[uint(w1)] = concurrencesOfW1
+			}
+			for w2, count2 := range wordCount {
+				if w1 != w2 {
+					count, exists := concurrencesOfW1[uint(w2)]
+					if !exists {
+						count = 0.0
+					}
+					concurrencesOfW1[uint(w2)] = count + float64(count1*count2)
+				}
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: return the concurrences
+	return concurrences
+}
+
+// =================================================================================================
+// func (this *Corpus) translate
+func (this *Corpus) translate(subCorpus *Corpus) *Corpus {
+	oldSubVocab := subCorpus.Vocab
+	translation := map[int]int{}
+	for word, oldID := range oldSubVocab {
+		newID, exists := this.Vocab[word]
+		if !exists {
+			log.Fatal("not a sub corpus")
+		}
+		translation[oldID] = newID
+	}
+
+	newDocs := make([]map[int]int, len(subCorpus.Docs))
+	for docID, oldDoc := range subCorpus.Docs {
+		newDoc := map[int]int{}
+		for oldID, count := range oldDoc {
+			newDoc[translation[oldID]] = count
+		}
+		newDocs[docID] = newDoc
+	}
+
+	return &Corpus{Vocab: this.Vocab, Docs: newDocs}
+}
+
+// =================================================================================================
 // interface LDAModel
 // brief description: the common interface of LDA models
 type TopicModel interface {
 	// train model for iter iteration
 	Train(numIters int)
 	// do inference for new doc with its wordCounts
-	Infer(words []string) []float64
+	Infer(doc map[int]int) []float64
 	// compute entropy
 	ComputeEntropy() float64
 	// compute relative entropy
@@ -405,23 +465,9 @@ func (this *LDA) Train(numIters int) {
 // =================================================================================================
 // func (this *LDA) Infer
 // brief description: infer topics on new documents
-func (this *LDA) Infer(words []string) []float64 {
+func (this *LDA) Infer(wordCounts map[int]int) []float64 {
 	// ---------------------------------------------------------------------------------------------
-	// step 1: convert words to word counts
-	wordCounts := map[int]int{}
-	for _, word := range words {
-		w, exists := this.Data.Vocab[word]
-		if exists {
-			count, exists := wordCounts[w]
-			if !exists {
-				count = 0
-			}
-			wordCounts[w] = count + 1
-		}
-	}
-
-	// ---------------------------------------------------------------------------------------------
-	// step 2: compute unscaled probabilities
+	// step 1: compute unscaled probabilities
 	probs := make([]float64, this.NumTopics)
 	sumProbs := float64(0.0)
 	numWords := len(this.Data.Vocab)
@@ -438,7 +484,7 @@ func (this *LDA) Infer(words []string) []float64 {
 	}
 
 	// ---------------------------------------------------------------------------------------------
-	// step 3: scale the probs to make their sum == 1.0
+	// step 2: scale the probs to make their sum == 1.0
 	if sumProbs == 0.0 {
 		sumProbs = 1.0
 	}
@@ -447,7 +493,7 @@ func (this *LDA) Infer(words []string) []float64 {
 	}
 
 	// ---------------------------------------------------------------------------------------------
-	// step 4: return the result
+	// step 3: return the result
 	return probs
 }
 
@@ -828,7 +874,7 @@ func (this *GSDMM) updateCounters() {
 		k := this.DocTopic[doc]
 		this.TopicDocCount[k]++
 		for w, count := range wordCounts {
-			this.TopicWordCount[w][k] += count
+			this.TopicWordCount[k][w] += count
 			this.TopicWordCountSum[k] += count
 		}
 	}
@@ -852,12 +898,13 @@ func (this *GSDMM) Init() {
 // =================================================================================================
 // func (this *GSDMM) probTopicOfDoc
 func (this *GSDMM) probTopicOfDoc(doc int, k int, idxK int) float64 {
-	numTopics := float64(len(this.Data.Docs))
+	numTopics := float64(this.NumTopics)
+	numDocs := float64(len(this.Data.Docs))
 	docCountOfTopic := float64(this.TopicDocCount[idxK])
 	if idxK == k {
 		docCountOfTopic--
 	}
-	docPart := (docCountOfTopic + this.Alpha) / (docCountOfTopic - 1.0 + this.Alpha*numTopics)
+	docPart := (docCountOfTopic + this.Alpha) / (numDocs - 1.0 + this.Alpha*numTopics)
 
 	topicWordCountSum := float64(this.TopicWordCountSum[idxK])
 	wordCounts := this.Data.Docs[doc]
@@ -880,6 +927,7 @@ func (this *GSDMM) probTopicOfDoc(doc int, k int, idxK int) float64 {
 		}
 	}
 
+	//fmt.Printf("docPart = %f, wordPart = %v, prod = %v\n", docPart, wordPart, docPart*wordPart)
 	return docPart * wordPart
 }
 
@@ -901,7 +949,8 @@ func (this *GSDMM) ResampleTopics(numIters int) {
 			go func() {
 				prefixSum := make([]float64, this.NumTopics)
 				for docs := range chDocs {
-					for doc := range docs {
+					//fmt.Println("-------------------------------------------")
+					for _, doc := range docs {
 						// (1.2.1) compute resampling probabilities
 						k := this.DocTopic[doc]
 						for idxK := 0; idxK < this.NumTopics; idxK++ {
@@ -912,6 +961,9 @@ func (this *GSDMM) ResampleTopics(numIters int) {
 								prefixSum[idxK] = prefixSum[idxK-1] + prob
 							}
 						}
+						// if doc < 10 {
+						// 	fmt.Printf("%d: %v\n", doc, prefixSum)
+						// }
 
 						// (1.2.2) use resampling probabilities to resample topic
 						u := rand.Float64() * prefixSum[this.NumTopics-1]
@@ -972,35 +1024,21 @@ func (this *GSDMM) Train(numIters int) {
 // =================================================================================================
 // func (this *GSDMM) Infer
 // brief description: infer topics on new documents
-func (this *GSDMM) Infer(words []string) []float64 {
+func (this *GSDMM) Infer(wordCounts map[int]int) []float64 {
 	// ---------------------------------------------------------------------------------------------
-	// step 1: convert words to word counts
-	wordCounts := map[int]int{}
-	for _, word := range words {
-		w, exists := this.Data.Vocab[word]
-		if exists {
-			count, exists := wordCounts[w]
-			if !exists {
-				count = 0
-			}
-			wordCounts[w] = count + 1
-		}
-	}
-
-	// ---------------------------------------------------------------------------------------------
-	// step 2: compute unscaled probabilities
+	// step 1: compute unscaled probabilities
 	probs := make([]float64, this.NumTopics)
 	sumProbs := float64(0.0)
 	numTopics := float64(len(this.Data.Docs))
 	numWords := float64(len(this.Data.Vocab))
 	for idxK := 0; idxK < this.NumTopics; idxK++ {
 		// -----------------------------------------------------------------------------------------
-		// (2.1) compute doc part of probs
+		// (1.1) compute doc part of probs
 		docCountOfTopic := float64(this.TopicDocCount[idxK])
 		docPart := (docCountOfTopic + this.Alpha) / (docCountOfTopic - 1.0 + this.Alpha*numTopics)
 
 		// -----------------------------------------------------------------------------------------
-		// (2.2) compute word part of probs
+		// (1.2) compute word part of probs
 		topicWordCountSum := float64(this.TopicWordCountSum[idxK])
 		idxWordInDoc := 0
 		wordPart := 1.0
@@ -1014,14 +1052,14 @@ func (this *GSDMM) Infer(words []string) []float64 {
 		}
 
 		// -----------------------------------------------------------------------------------------
-		// (2.3) assemble myProb
+		// (1.3) assemble myProb
 		myProb := docPart * wordPart
 		sumProbs += myProb
 		probs[idxK] = myProb
 	}
 
 	// ---------------------------------------------------------------------------------------------
-	// step 3: scale the probs to make their sum == 1.0
+	// step 2: scale the probs to make their sum == 1.0
 	if sumProbs == 0.0 {
 		sumProbs = 1.0
 	}
@@ -1030,7 +1068,7 @@ func (this *GSDMM) Infer(words []string) []float64 {
 	}
 
 	// ---------------------------------------------------------------------------------------------
-	// step 4: return the result
+	// step 3: return the result
 	return probs
 }
 
@@ -1053,7 +1091,11 @@ func (this *GSDMM) ComputeEntropy() float64 {
 		myEntropy := 0.0
 		if mySumProbs > 0.0 {
 			for idxK := 0; idxK < this.NumTopics; idxK++ {
-				myP := myProbs[k] / mySumProbs
+				myP := myProbs[idxK] / mySumProbs
+				if myP == 0.0 {
+					continue
+				}
+				//fmt.Printf("%d: myP = %f\n", idxK, myP)
 				myEntropy -= myP * math.Log(myP)
 			}
 		}
@@ -1070,6 +1112,18 @@ func (this *GSDMM) ComputeRelativeEntropy() float64 {
 	entropy := this.ComputeEntropy()
 	maxEntropy := -math.Log(1.0 / float64(this.NumTopics))
 	return entropy / maxEntropy
+}
+
+// =================================================================================================
+// struct WPDM
+// brief description: the data structure of WPDM model
+type WPDM struct {
+	eps    float64 // radius of neighborhood
+	minPts uint    // minimum points for a dense neighborhood in DBScan, set this to 0 for AHC
+
+	Data      *Corpus // the input corpus
+	DocTopic  []int   // doc-topic table
+	NumTopics int     // number of topics
 }
 
 // ===========================================================================================
@@ -1576,6 +1630,139 @@ func (g *CitationGraph) GetPhraseSimilarityTL() map[string]map[string]float64 {
 }
 
 // =================================================================================================
+// func (g *CitationGraph) CreateCorpus
+// brief description: create a corpus from a citation graph
+// input
+//	corpusType:
+//		0 for title + ref titles per document for main nodes,
+//		1 for title per document for main nodes,
+//		2 for title per document for all nodes,
+//		3 for labels per document for main nodes,
+func (g *CitationGraph) CreateCorpus(corpusType int) *Corpus {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create an empty corpus
+	corpus := NewCorpus()
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: create goroutines to add documents to the corpuse
+	numCPUs := runtime.NumCPU()
+	chNodes := make(chan map[int]*CitationNode)
+	chWorkers := make(chan bool)
+	numNodes := len(g.ToBeAnalyzed)
+	if corpusType == 2 {
+		numNodes = len(g.Nodes)
+	}
+	wordsOfNode := make([][]string, numNodes)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			for nodes := range chNodes {
+				for idxNode, node := range nodes {
+					// (2.1) create an empty phrase list
+					words := []string{}
+
+					// (2.2) extract words of phrases in title and put them in the phrase list
+					if corpusType <= 2 {
+						phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
+						for _, candidate := range phraseCandidates {
+							candidateWords := strings.Split(candidate, " ")
+							for _, word := range candidateWords {
+								words = append(words, word)
+							}
+						}
+					}
+
+					// (2.3) extract words of phrases in reference titles and put them in the
+					// phrase list
+					if corpusType <= 0 {
+						for _, refID := range node.Refs {
+							refNode := g.Nodes[refID]
+							phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(refNode.Title)
+							for _, candidate := range phraseCandidates {
+								candidateWords := strings.Split(candidate, " ")
+								for _, word := range candidateWords {
+									words = append(words, word)
+								}
+							}
+						}
+					}
+
+					// (2.4) stem labels of the node and put them in phrase list
+					if corpusType == 3 {
+						for _, label := range node.Labels {
+							phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(label)
+							for _, candidate := range phraseCandidates {
+								words = append(words, candidate)
+							}
+						}
+					}
+
+					// (2.5) record the phrases
+					wordsOfNode[idxNode] = words
+				}
+			}
+			chWorkers <- true
+		}()
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: put nodes into the input channel
+	nodes := map[int]*CitationNode{}
+	nodeIDsSent := map[int]bool{}
+	for idx, id := range g.ToBeAnalyzed {
+		// (1.1) get a node
+		node := g.Nodes[id]
+
+		// (1.2) append nodes with this node
+		nodes[idx] = node
+		nodeIDsSent[int(id)] = true
+
+		// (1.3) send nodes when nodes are large enough
+		if len(nodes) == 100 || idx+1 == len(g.ToBeAnalyzed) {
+			chNodes <- nodes
+			nodes = map[int]*CitationNode{}
+		}
+	}
+	if corpusType == 2 {
+		// send nodes not in main nodes
+		idx := len(g.ToBeAnalyzed)
+		for id, node := range g.Nodes {
+			// (1.4) skips those already sent
+			_, alreadySent := nodeIDsSent[int(id)]
+			if alreadySent {
+				continue
+			}
+
+			// (1.5) append nodes with this node
+			nodes[idx] = node
+			nodeIDsSent[int(id)] = true
+
+			// (1.6) send nodes when nodes are large enough
+			if len(nodes) == 100 {
+				chNodes <- nodes
+				nodes = map[int]*CitationNode{}
+			}
+			idx++
+		}
+		// (1.7) send the rest of nodes
+		if len(nodes) > 0 {
+			chNodes <- nodes
+		}
+	}
+	// (1.8) close channel
+	close(chNodes)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: wait for all workers
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+	for _, words := range wordsOfNode {
+		corpus.AddDoc(words)
+	}
+	return corpus
+}
+
+// =================================================================================================
 // func (g *CitationGraph) ClusterByLDA
 // brief description: cluster the main nodes of g with their titles and their reference titles using
 //	using LDA.
@@ -1592,96 +1779,261 @@ func (g *CitationGraph) ClusterByLDA(numTopics int, alpha, beta float64, numIter
 	}
 	// ---------------------------------------------------------------------------------------------
 	// step 1: create corpus for the main nodes
-	corpus := NewCorpus()
+	corpus := g.CreateCorpus(0)
 
 	// ---------------------------------------------------------------------------------------------
-	// step 2: create goroutines to add documents to the corpuse
-	numCPUs := runtime.NumCPU()
-	chNodes := make(chan map[int64]*CitationNode)
-	chPhrases := make(chan map[int64][]string)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		go func() {
-			phrasess := map[int64][]string{}
-			for nodes := range chNodes {
-				for nodeID, node := range nodes {
-					// (2.1) create an empty phrase list
-					phrases := []string{}
-
-					// (2.2) extract all possible phrases in title and put them in the phrase list
-					phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
-					for _, candidate := range phraseCandidates {
-						candidateWords := strings.Split(candidate, " ")
-						for _, phrase := range candidateWords {
-							phrases = append(phrases, phrase)
-						}
-					}
-
-					// (2.3) extract all possible phrases in reference titles and put them in the
-					// phrase list
-					for _, refID := range node.Refs {
-						refNode := g.Nodes[refID]
-						phraseCandidates = KeyphraseExtraction.ExtractKeyPhraseCandidates(refNode.Title)
-						for _, candidate := range phraseCandidates {
-							candidatePhrases := KeyphraseExtraction.GetAllPossiblePhrases(candidate)
-							for _, phrase := range candidatePhrases {
-								phrases = append(phrases, phrase)
-							}
-						}
-					}
-
-					// (2.4) record the phrases
-					phrasess[nodeID] = phrases
-				}
-			}
-			chPhrases <- phrasess
-		}()
-	}
-
-	// ---------------------------------------------------------------------------------------------
-	// step 3: put nodes into the input channel
-	nodes := map[int64]*CitationNode{}
-	for idx, id := range g.ToBeAnalyzed {
-		// (1.1) get a node
-		node := g.Nodes[id]
-
-		// (1.2) append nodes with this node
-		nodes[id] = node
-
-		// (1.3) send nodes when nodes are full
-		if (idx+1)%len(nodes) == 0 || idx+1 == len(g.ToBeAnalyzed) {
-			chNodes <- nodes
-			nodes = map[int64]*CitationNode{}
-		}
-	}
-	close(chNodes)
-
-	// ---------------------------------------------------------------------------------------------
-	// step 4: recieve phrases from the output channel
-	phrasesOfNodes := map[int64][]string{}
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		phrasess := <-chPhrases
-		for nodeID, phrases := range phrasess {
-			phrasesOfNodes[nodeID] = phrases
-		}
-	}
-	for _, phrases := range phrasesOfNodes {
-		corpus.AddDoc(phrases)
-	}
-
-	// ---------------------------------------------------------------------------------------------
-	// step 5: use the corpus to compute LDA
+	// step 2: use the corpus to compute LDA
 	LDA := NewLDA(numTopics, alpha, beta, corpus)
 	LDA.Train(numIters)
 
 	// ---------------------------------------------------------------------------------------------
-	// step 6: infer cluster memberships for each node
+	// step 3: infer cluster memberships for each node
 	memberships := map[int64][]float64{}
-	for nodeID, phrases := range phrasesOfNodes {
-		membershipsOfNode := LDA.Infer(phrases)
+	for docID, doc := range corpus.Docs {
+		nodeID := g.ToBeAnalyzed[docID]
+		membershipsOfNode := LDA.Infer(doc)
 		memberships[nodeID] = membershipsOfNode
 	}
 
 	// ---------------------------------------------------------------------------------------------
-	// step 7: return the result
+	// step 4: return the result
+	return memberships
+}
+
+// =================================================================================================
+// func (g *CitationGraph) ClusterTitlesByWPDM
+// brief description: cluster the main nodes of g with their titles and their reference titles using
+//	using LDA.
+// input:
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+//	workSpaceFileName: a file name for intermediate result
+// output:
+//	for each main node, gives the likelihoods the node belonging to a cluster.
+func (g *CitationGraph) ClusterTitlesByWPDM(eps float64, minPts uint, simType int,
+	workSpaceFileName string) []map[uint]bool {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create corpus for all nodes
+	corpus := g.CreateCorpus(2)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: create concurrences from corpus
+	concurrences := corpus.GetConcurrences()
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: create corpus for main nodes
+	mainCorpus := g.CreateCorpus(1)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: translate mainCorpus to corpus
+	mainCorpus = corpus.translate(mainCorpus)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: cluster mainCorpus using WPDM
+	cm := ConcurrenceBasedClustering.NewConcurrenceModel()
+	cm.SetPairFilter(0.1, 3.0)
+	cm.SetConcurrences(uint(len(corpus.Vocab)), concurrences)
+	groups := make([]map[uint]bool, len(mainCorpus.Docs))
+	for docID, doc := range mainCorpus.Docs {
+		group := map[uint]bool{}
+		for w, _ := range doc {
+			group[uint(w)] = true
+		}
+		groups[docID] = group
+	}
+	communities := []map[uint]bool{}
+	if minPts > 0 {
+		communities = cm.GroupPairDBScan(groups, eps, minPts, simType, workSpaceFileName)
+	} else {
+		communities = cm.GroupPairAHC(groups, eps, simType, workSpaceFileName)
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 6: return the result
+	return communities
+}
+
+// =================================================================================================
+// func (g *CitationGraph) ClusterLabelsByWPDM
+// brief description: cluster the main nodes of g with their titles and their reference titles using
+//	using LDA.
+// input:
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+//	workSpaceFileName: a file name for intermediate result
+// output:
+//	for each main node, gives the likelihoods the node belonging to a cluster.
+func (g *CitationGraph) ClusterLabelsByWPDM(eps float64, minPts uint, simType int,
+	workSpaceFileName string) []map[uint]bool {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create corpus for labels at main nodes
+	corpus := g.CreateCorpus(3)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: create concurrences from corpus
+	concurrences := corpus.GetConcurrences()
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: cluster corpuse using WPDM
+	cm := ConcurrenceBasedClustering.NewConcurrenceModel()
+	cm.SetConcurrences(uint(len(corpus.Vocab)), concurrences)
+	groups := make([]map[uint]bool, len(corpus.Docs))
+	for docID, doc := range corpus.Docs {
+		group := map[uint]bool{}
+		for w, _ := range doc {
+			group[uint(w)] = true
+		}
+		groups[docID] = group
+	}
+	communities := []map[uint]bool{}
+	if minPts > 0 {
+		communities = cm.GroupPairDBScan(groups, eps, minPts, simType, workSpaceFileName)
+	} else {
+		communities = cm.GroupPairAHC(groups, eps, simType, workSpaceFileName)
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 6: return the result
+	return communities
+}
+
+// =================================================================================================
+// func (g *CitationGraph) ClusterTitlesByDBScan
+// brief description: cluster the main nodes of g with their titles and their reference titles using
+//	using LDA.
+// input:
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+// output:
+//	for each main node, gives the likelihoods the node belonging to a cluster.
+// func (g *CitationGraph) ClusterTitlesByDBScan(eps float64, minPts uint, simType int,
+// ) map[int64][]float64 {
+
+// }
+
+// =================================================================================================
+// func (g *CitationGraph) ClusterLabelsByDBScan
+// brief description: cluster the main nodes of g with their titles and their reference titles using
+//	using LDA.
+// input:
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+// output:
+//	for each main node, gives the likelihoods the node belonging to a cluster.
+// func (g *CitationGraph) ClusterTitlesByDBScan(eps float64, minPts uint, simType int,
+// ) map[int64][]float64 {
+
+// }
+
+// =================================================================================================
+// func (g *CitationGraph) ClusterTitlesByGSDMM
+// brief description: cluster the main nodes of g with their titles and their reference titles using
+//	using LDA.
+// input:
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+// output:
+//	for each main node, gives the likelihoods the node belonging to a cluster.
+func (g *CitationGraph) ClusterTitlesByGSDMM(numTopics int, alpha, beta float64, numIters int,
+) map[int64][]float64 {
+	if numTopics <= 0 || alpha <= 0.0 || beta <= 0.0 || numIters <= 0 {
+		log.Fatalln("all parameters of ClusterByLDA must be > 0")
+	}
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create corpus for the main nodes
+	corpus := g.CreateCorpus(0)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: use the corpus to compute LDA
+	GSDMM := NewGSDMM(numTopics, alpha, beta, corpus)
+	GSDMM.Train(numIters)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: infer cluster memberships for each node
+	memberships := map[int64][]float64{}
+	for docID, doc := range corpus.Docs {
+		nodeID := g.ToBeAnalyzed[docID]
+		membershipsOfNode := GSDMM.Infer(doc)
+		memberships[nodeID] = membershipsOfNode
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: return the result
+	return memberships
+}
+
+// =================================================================================================
+// func (g *CitationGraph) ClusterLabelsByGSDMM
+// brief description: cluster the main nodes of g with their titles and their reference titles using
+//	using LDA.
+// input:
+//	eps: the radius of neighborhood.
+//	minPts: Only if the neighborhood of a point contains at least minPt points
+//		(the center point of the neighborhood included), the neighborhood is
+//		called dense. Only dense neighborhoods are connected to communities.
+//	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
+//		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
+//		normalized jaccard similarity
+// output:
+//	for each main node, gives the likelihoods the node belonging to a cluster.
+// func (g *CitationGraph) ClusterTitlesByGSDMM(eps float64, minPts uint, simType int,
+// ) map[int64][]float64 {
+
+// }
+func (g *CitationGraph) ClusterLabelsByGSDMM(numTopics int, alpha, beta float64, numIters int,
+) map[int64][]float64 {
+	if numTopics <= 0 || alpha <= 0.0 || beta <= 0.0 || numIters <= 0 {
+		log.Fatalln("all parameters of ClusterByLDA must be > 0")
+	}
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create corpus for labels of the main nodes
+	corpus := g.CreateCorpus(3)
+	// reverse corpus Vocab
+	reverseVocab := map[int]string{}
+	for w, j := range corpus.Vocab {
+		reverseVocab[j] = w
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: use the corpus to compute LDA
+	GSDMM := NewGSDMM(numTopics, alpha, beta, corpus)
+	GSDMM.Train(numIters)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: infer cluster memberships for each node
+	memberships := map[int64][]float64{}
+	for docID, doc := range corpus.Docs {
+		nodeID := g.ToBeAnalyzed[docID]
+		membershipsOfNode := GSDMM.Infer(doc)
+		memberships[nodeID] = membershipsOfNode
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: return the result
 	return memberships
 }
