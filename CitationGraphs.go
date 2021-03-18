@@ -3,6 +3,7 @@ package CitationGraphs
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -66,14 +67,23 @@ type CitationNode struct {
 type CitationGraph struct {
 	Nodes        map[int64]*CitationNode
 	ToBeAnalyzed []int64
+	idxMainNodes map[int64]int
 }
 
 // =================================================================================================
 // struct Corpus
-// brief description: the corpus data structure of LDA algorithms
+// brief description: the corpus data structure
 type Corpus struct {
 	Vocab map[string]int // the vocabulary
 	Docs  []map[int]int  // keys: docID, wordID, value: word count
+}
+
+// =================================================================================================
+// struct CorpusX
+// brief description: the extended corpus data structure
+type CorpusX struct {
+	Vocab map[string]int  // the vocabulary
+	Docs  [][]map[int]int // keys: docID, wordID, value: word count
 }
 
 // =================================================================================================
@@ -83,6 +93,16 @@ func NewCorpus() *Corpus {
 	return &Corpus{
 		Vocab: map[string]int{},
 		Docs:  []map[int]int{},
+	}
+}
+
+// =================================================================================================
+// func NewCorpusX
+// brief description: create an empty corpus
+func NewCorpusX() *CorpusX {
+	return &CorpusX{
+		Vocab: map[string]int{},
+		Docs:  [][]map[int]int{},
 	}
 }
 
@@ -113,6 +133,35 @@ func (this *Corpus) AddDoc(words []string) {
 }
 
 // =================================================================================================
+// func (this *CorpusX) AddDoc
+// brief description: add one document to corpus with specified docId and word count list, if the
+// 	specified docId already exists in corpus, the old doc will be overwritted
+func (this *CorpusX) AddDoc(words [][]string) {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create a new doc and count word counts
+	doc := make([]map[int]int, len(words))
+	for idx, wordGroup := range words {
+		doc[idx] = map[int]int{}
+		for _, word := range wordGroup {
+			wordID, exists := this.Vocab[word]
+			if !exists {
+				wordID = len(this.Vocab)
+				this.Vocab[word] = wordID
+			}
+			count, exists := doc[idx][wordID]
+			if !exists {
+				count = 0
+			}
+			doc[idx][wordID] = count + 1
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: add the new doc into docs
+	this.Docs = append(this.Docs, doc)
+}
+
+// =================================================================================================
 // func (this *Corpus) GetConcurrences
 // brief description: get concurrences from corpus
 func (this *Corpus) GetConcurrences() map[uint]map[uint]float64 {
@@ -121,28 +170,174 @@ func (this *Corpus) GetConcurrences() map[uint]map[uint]float64 {
 	concurrences := map[uint]map[uint]float64{}
 
 	// ---------------------------------------------------------------------------------------------
-	// step 2: count concurrences when words are in the same document
-	for _, wordCount := range this.Docs {
-		for w1, count1 := range wordCount {
-			concurrencesOfW1, exists := concurrences[uint(w1)]
-			if !exists {
-				concurrencesOfW1 = map[uint]float64{}
-				concurrences[uint(w1)] = concurrencesOfW1
-			}
-			for w2, count2 := range wordCount {
-				if w1 != w2 {
-					count, exists := concurrencesOfW1[uint(w2)]
-					if !exists {
-						count = 0.0
+	// step 2: spawn goroutines to count concurrences when words are in the same document
+	numCPUs := runtime.NumCPU()
+	numDocs := len(this.Docs)
+	chI := make(chan int)
+	chWorkers := make(chan bool)
+	lock := sync.RWMutex{}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			myConcurrences := map[uint]map[uint]float64{}
+			for i0 := range chI {
+				i1 := i0 + 100
+				if i1 > numDocs {
+					i1 = numDocs
+				}
+				for i := i0; i < i1; i++ {
+					wordCount := this.Docs[i]
+					for w1, count1 := range wordCount {
+						concurrencesOfW1, exists := myConcurrences[uint(w1)]
+						if !exists {
+							concurrencesOfW1 = map[uint]float64{}
+							myConcurrences[uint(w1)] = concurrencesOfW1
+						}
+						for w2, count2 := range wordCount {
+							if w1 != w2 {
+								count, exists := concurrencesOfW1[uint(w2)]
+								if !exists {
+									count = 0.0
+								}
+								concurrencesOfW1[uint(w2)] = count + float64(count1*count2)
+							}
+						}
 					}
-					concurrencesOfW1[uint(w2)] = count + float64(count1*count2)
 				}
 			}
-		}
+
+			// now we merge the results into concurrences
+			lock.Lock()
+			defer lock.Unlock()
+			for key1, value1 := range myConcurrences {
+				row, exists := concurrences[key1]
+				if !exists {
+					concurrences[key1] = value1
+				} else {
+					for key2, value2 := range value1 {
+						oldValue, exists := row[key2]
+						if !exists {
+							oldValue = 0.0
+						}
+						row[key2] = oldValue + value2
+					}
+				}
+			}
+
+			// tell main thread that this worker finishes
+			chWorkers <- true
+		}()
 	}
 
 	// ---------------------------------------------------------------------------------------------
-	// step 3: return the concurrences
+	// step	3: send tasks through chI
+	for i := 0; i < numDocs; i += 100 {
+		chI <- i
+	}
+	close(chI)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: wait for all workers
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: return the concurrences
+	return concurrences
+}
+
+// =================================================================================================
+// func (this *CorpusX) GetConcurrences
+// brief description: get concurrences from corpus
+func (this *CorpusX) GetConcurrences() map[uint]map[uint]float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create concurrences
+	concurrences := map[uint]map[uint]float64{}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: spawn goroutines to count concurrences when words are in the same document
+	numCPUs := runtime.NumCPU()
+	numDocs := len(this.Docs)
+	chI := make(chan int)
+	chWorkers := make(chan bool)
+	lock := sync.RWMutex{}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			myConcurrences := map[uint]map[uint]float64{}
+			for i0 := range chI {
+				i1 := i0 + 100
+				if i1 > numDocs {
+					i1 = numDocs
+				}
+				for i := i0; i < i1; i++ {
+					wordGroups := this.Docs[i]
+					for idx1, wordCount1 := range wordGroups {
+						for w1, count1 := range wordCount1 {
+							concurrencesOfW1, exists := myConcurrences[uint(w1)]
+							if !exists {
+								concurrencesOfW1 = map[uint]float64{}
+								myConcurrences[uint(w1)] = concurrencesOfW1
+							}
+							for idx2, wordCount2 := range wordGroups {
+								// skip same word group
+								if idx1 == idx2 {
+									continue
+								}
+
+								for w2, count2 := range wordCount2 {
+									if w1 != w2 {
+										count, exists := concurrencesOfW1[uint(w2)]
+										if !exists {
+											count = 0.0
+										}
+										concurrencesOfW1[uint(w2)] = count + float64(count1*count2)
+									}
+								}
+							}
+						}
+					}
+
+				}
+			}
+
+			// now we merge the results into concurrences
+			lock.Lock()
+			defer lock.Unlock()
+			for key1, value1 := range myConcurrences {
+				row, exists := concurrences[key1]
+				if !exists {
+					concurrences[key1] = value1
+				} else {
+					for key2, value2 := range value1 {
+						oldValue, exists := row[key2]
+						if !exists {
+							oldValue = 0.0
+						}
+						row[key2] = oldValue + value2
+					}
+				}
+			}
+
+			// tell main thread that this worker finishes
+			chWorkers <- true
+		}()
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step	3: send tasks through chI
+	for i := 0; i < numDocs; i += 100 {
+		chI <- i
+	}
+	close(chI)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: wait for all workers
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: return the concurrences
 	return concurrences
 }
 
@@ -169,6 +364,34 @@ func (this *Corpus) translate(subCorpus *Corpus) *Corpus {
 	}
 
 	return &Corpus{Vocab: this.Vocab, Docs: newDocs}
+}
+
+// =================================================================================================
+// func (this *CorpusX) translate
+func (this *CorpusX) translate(subCorpus *CorpusX) *CorpusX {
+	oldSubVocab := subCorpus.Vocab
+	translation := map[int]int{}
+	for word, oldID := range oldSubVocab {
+		newID, exists := this.Vocab[word]
+		if !exists {
+			log.Fatal("not a sub corpus")
+		}
+		translation[oldID] = newID
+	}
+
+	newDocs := make([][]map[int]int, len(subCorpus.Docs))
+	for docID, oldDoc := range subCorpus.Docs {
+		newDoc := make([]map[int]int, len(oldDoc))
+		for idxGroup, oldWordGroup := range oldDoc {
+			newDoc[idxGroup] = map[int]int{}
+			for oldID, count := range oldWordGroup {
+				newDoc[idxGroup][translation[oldID]] = count
+			}
+		}
+		newDocs[docID] = newDoc
+	}
+
+	return &CorpusX{Vocab: this.Vocab, Docs: newDocs}
 }
 
 // =================================================================================================
@@ -635,6 +858,7 @@ func LoadCitationGraph(path string, prefix string) *CitationGraph {
 	// step 1: Prepare the data structure of the result.
 	result := new(CitationGraph)
 	result.Nodes = make(map[int64]*CitationNode)
+	result.idxMainNodes = map[int64]int{}
 
 	// --------------------------------------------------------------------------------------
 	// step 2: Assemble the file names for nodes, edges, and labels.
@@ -685,6 +909,7 @@ func LoadCitationGraph(path string, prefix string) *CitationGraph {
 		node.Title = title
 		result.Nodes[id] = node
 		if isMainNode {
+			result.idxMainNodes[id] = len(result.ToBeAnalyzed)
 			result.ToBeAnalyzed = append(result.ToBeAnalyzed, id)
 		}
 	}
@@ -1298,32 +1523,51 @@ func (g *CitationGraph) TFIDF() []map[string]float64 {
 // output:
 //	the result of Fuzzy TFIDF grouped by the main nodes of the CitationGraph
 func (g *CitationGraph) SimTFIDF(phraseSimilarity map[string]map[string]float64) []map[string]float64 {
-	candidateTFGroups := []map[string]float64{}
-	phraseCandidateGroups := [][]string{}
+	numMainNodes := len(g.ToBeAnalyzed)
+	candidateTFGroups := make([]map[string]float64, numMainNodes)
+	phraseCandidateGroups := make([][]string, numMainNodes)
 
-	for idxID, id := range g.ToBeAnalyzed {
-		// get phrase candidates
-		node := g.Nodes[id]
-		phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
+	numCPUs := runtime.NumCPU()
+	chI := make(chan int)
+	chWorkers := make(chan bool)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			for idx0 := range chI {
+				idx1 := idx0 + 100
+				if idx1 > numMainNodes {
+					idx1 = numMainNodes
+				}
+				for idxID := idx0; idxID < idx1; idxID++ {
+					// get phrase candidates
+					id := g.ToBeAnalyzed[idxID]
+					node := g.Nodes[id]
+					phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
 
-		// collect a list of auxiliary phrases
-		auxPhrases := []string{}
-		for _, refID := range node.Refs {
-			refPhrases := KeyphraseExtraction.ExtractKeyPhraseCandidates(g.Nodes[refID].Title)
-			for _, phrase := range refPhrases {
-				auxPhrases = append(auxPhrases, phrase)
+					// collect a list of auxiliary phrases
+					auxPhrases := []string{}
+					for _, refID := range node.Refs {
+						refPhrases := KeyphraseExtraction.ExtractKeyPhraseCandidates(g.Nodes[refID].Title)
+						for _, phrase := range refPhrases {
+							auxPhrases = append(auxPhrases, phrase)
+						}
+					}
+
+					// compute Sim TF
+					candidateTFGroups[idxID] = KeyphraseExtraction.SimTF(phraseCandidates, auxPhrases, phraseSimilarity)
+
+					// insert this group of phraseCandidates to the candidate groups
+					phraseCandidateGroups[idxID] = phraseCandidates
+				}
 			}
-		}
-
-		// compute Fuzzy TF
-		candidateTFGroups = append(candidateTFGroups, KeyphraseExtraction.SimTF(phraseCandidates, auxPhrases, phraseSimilarity))
-
-		// append this group of phraseCandidates to the candidate groups
-		phraseCandidateGroups = append(phraseCandidateGroups, phraseCandidates)
-
-		if (idxID+1)%1000 == 0 {
-			fmt.Printf("%d of %d sim TF computed\n", idxID+1, len(g.ToBeAnalyzed))
-		}
+			chWorkers <- true
+		}()
+	}
+	for i := 0; i < numMainNodes; i += 100 {
+		chI <- i
+	}
+	close(chI)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
 	}
 	fmt.Println("All sim TF computed")
 
@@ -1332,8 +1576,8 @@ func (g *CitationGraph) SimTFIDF(phraseSimilarity map[string]map[string]float64)
 	fmt.Println(("sim IDF computed"))
 
 	// TFIDF = TF * IDF
-	result := []map[string]float64{}
-	for _, candidateTFs := range candidateTFGroups {
+	result := make([]map[string]float64, numMainNodes)
+	for idx, candidateTFs := range candidateTFGroups {
 		groupResult := map[string]float64{}
 		for text, tf := range candidateTFs {
 			idf, exists := IDFs[text]
@@ -1342,7 +1586,23 @@ func (g *CitationGraph) SimTFIDF(phraseSimilarity map[string]map[string]float64)
 			}
 			groupResult[text] = float64(tf) * idf
 		}
-		result = append(result, groupResult)
+		sortedGroupResult := KeyphraseExtraction.ArgSort(groupResult)
+		selectedGroupResult := map[string]float64{}
+		for i := 0; i < len(sortedGroupResult); i++ {
+			phraseI := sortedGroupResult[i]
+			selected := true
+			for phraseJ, _ := range selectedGroupResult {
+				if KeyphraseExtraction.Includes(phraseJ, phraseI) ||
+					KeyphraseExtraction.Includes(phraseI, phraseJ) {
+					selected = false
+					break
+				}
+			}
+			if selected {
+				selectedGroupResult[phraseI] = groupResult[phraseI]
+			}
+		}
+		result[idx] = selectedGroupResult
 	}
 
 	// return the result
@@ -1409,7 +1669,7 @@ func (g *CitationGraph) SimTFSimIDF(phraseSimilarity map[string]map[string]float
 }
 
 // =================================================================================================
-// method GetPhraseSimilarityTL
+// method GetPhraseSimilarity
 // brief description: compute the similarities between pairs of phrases and gives them in form of a
 //	sparse matrix using Title Link method
 // input:
@@ -1420,7 +1680,129 @@ func (g *CitationGraph) SimTFSimIDF(phraseSimilarity map[string]map[string]float
 //	The title link method can be found in:
 //	Bogomolova, A., Ryazanova, M., & Balk, I. (2021). Cluster approach to analysis of publication
 //	titles. In Journal of Physics: Conference Series (Vol. 1727, No. 1, p. 012016). IOP Publishing.
-func (g *CitationGraph) GetPhraseSimilarityTL() map[string]map[string]float64 {
+func (g *CitationGraph) GetPhraseSimilarity(simType int) map[string]map[string]float64 {
+	// --------------------------------------------------------------------------------------------
+	// step 1: create corpus using all nodes
+	corpus := g.CreateCorpus(2)
+
+	// --------------------------------------------------------------------------------------------
+	// step 2: get concurrences from corpuse
+	concurrences := corpus.GetConcurrences()
+
+	// --------------------------------------------------------------------------------------------
+	// step 3: create concurrence model from concurrences
+	cm := ConcurrenceBasedClustering.NewConcurrenceModel()
+	cm.SetConcurrences(uint(len(corpus.Vocab)), concurrences)
+
+	// --------------------------------------------------------------------------------------------
+	// step 4: get similarity
+	simMat := map[uint]map[uint]float64{}
+	switch simType {
+	case 0:
+		simMat = cm.InduceSimilarities()
+	case 1:
+		simMat = cm.InduceNormalizedSimilarities()
+	case 2:
+		simMat = cm.InduceJaccardSimilarities()
+	case 3:
+		simMat = cm.InduceWeightedJaccardSimilarities()
+	case 4:
+		simMat = cm.InduceNormalizedJaccardSimilarities()
+	}
+
+	// --------------------------------------------------------------------------------------------
+	// step 6: conver simMat to the result then return it
+	result := map[string]map[string]float64{}
+	words := make([]string, len(corpus.Vocab))
+	for word, idx := range corpus.Vocab {
+		words[idx] = word
+	}
+	for i, row := range simMat {
+		wordI := words[i]
+		rowI := map[string]float64{}
+		for j, value := range row {
+			wordJ := words[j]
+			rowI[wordJ] = value
+		}
+		result[wordI] = rowI
+	}
+	return result
+}
+
+// =================================================================================================
+// method GetPhraseSimilarityX
+// brief description: compute the similarities between pairs of phrases and gives them in form of a
+//	sparse matrix using Title Link method
+// input:
+// 	nothing
+// output:
+//	the sparse matrix of phrase similarities
+// note:
+//	The title link method can be found in:
+//	Bogomolova, A., Ryazanova, M., & Balk, I. (2021). Cluster approach to analysis of publication
+//	titles. In Journal of Physics: Conference Series (Vol. 1727, No. 1, p. 012016). IOP Publishing.
+func (g *CitationGraph) GetPhraseSimilarityX(simType int) map[string]map[string]float64 {
+	// --------------------------------------------------------------------------------------------
+	// step 1: create corpus using all nodes
+	corpus := g.CreateCorpusX(2)
+
+	// --------------------------------------------------------------------------------------------
+	// step 2: get concurrences from corpuse
+	concurrences := corpus.GetConcurrences()
+
+	// --------------------------------------------------------------------------------------------
+	// step 3: create concurrence model from concurrences
+	cm := ConcurrenceBasedClustering.NewConcurrenceModel()
+	cm.SetConcurrences(uint(len(corpus.Vocab)), concurrences)
+
+	// --------------------------------------------------------------------------------------------
+	// step 4: get similarity
+	simMat := map[uint]map[uint]float64{}
+	switch simType {
+	case 0:
+		simMat = cm.InduceSimilarities()
+	case 1:
+		simMat = cm.InduceNormalizedSimilarities()
+	case 2:
+		simMat = cm.InduceJaccardSimilarities()
+	case 3:
+		simMat = cm.InduceWeightedJaccardSimilarities()
+	case 4:
+		simMat = cm.InduceNormalizedJaccardSimilarities()
+	}
+
+	// --------------------------------------------------------------------------------------------
+	// step 6: conver simMat to the result then return it
+	result := map[string]map[string]float64{}
+	words := make([]string, len(corpus.Vocab))
+	for word, idx := range corpus.Vocab {
+		words[idx] = word
+	}
+	for i, row := range simMat {
+		wordI := words[i]
+		rowI := map[string]float64{}
+		for j, value := range row {
+			wordJ := words[j]
+			rowI[wordJ] = value
+		}
+		result[wordI] = rowI
+	}
+	return result
+}
+
+// =================================================================================================
+// method GetPhraseSimilarityHSPP
+// brief description: compute the similarities between pairs of phrases and gives them in form of a
+//	sparse matrix using Hierarchical Sparse Phrase Pair method
+// input:
+// 	nothing
+// output:
+//	the sparse matrix of phrase similarities
+// note:
+//	The title link method can be found in:
+//	Bogomolova, A., Ryazanova, M., & Balk, I. (2021). Cluster approach to analysis of publication
+//	titles. In Journal of Physics: Conference Series (Vol. 1727, No. 1, p. 012016). IOP Publishing.
+func (g *CitationGraph) GetPhraseSimilarityHSPP() map[string]map[string]float64 {
 	// --------------------------------------------------------------------------------------------
 	// step 1: count the phrase-pair frequencies
 	pairFreq := map[string]map[string]uint{}
@@ -1763,6 +2145,134 @@ func (g *CitationGraph) CreateCorpus(corpusType int) *Corpus {
 }
 
 // =================================================================================================
+// func (g *CitationGraph) CreateCorpusX
+// brief description: create a corpusX from a citation graph
+// input
+//	corpusType:
+//		0 for title + ref titles per document for main nodes,
+//		1 for title per document for main nodes,
+//		2 for title per document for all nodes,
+func (g *CitationGraph) CreateCorpusX(corpusType int) *CorpusX {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create an empty corpus
+	corpus := NewCorpusX()
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: create goroutines to add documents to the corpuse
+	numCPUs := runtime.NumCPU()
+	chNodes := make(chan map[int]*CitationNode)
+	chWorkers := make(chan bool)
+	numNodes := len(g.ToBeAnalyzed)
+	if corpusType == 2 {
+		numNodes = len(g.Nodes)
+	}
+	wordsOfNode := make([][][]string, numNodes)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			for nodes := range chNodes {
+				for idxNode, node := range nodes {
+					// (2.1) create an empty phrase list
+					words := [][]string{}
+
+					// (2.2) extract words of phrases in title and put them in the phrase list
+					if corpusType <= 2 {
+						phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
+						for _, candidate := range phraseCandidates {
+							candidateWords := KeyphraseExtraction.GetAllPossiblePhrases(candidate)
+							words = append(words, candidateWords)
+						}
+					}
+
+					// (2.3) extract words of phrases in reference titles and put them in the
+					// phrase list
+					if corpusType <= 0 {
+						for _, refID := range node.Refs {
+							refNode := g.Nodes[refID]
+							phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(refNode.Title)
+							for _, candidate := range phraseCandidates {
+								candidateWords := KeyphraseExtraction.GetAllPossiblePhrases(candidate)
+								words = append(words, candidateWords)
+							}
+						}
+					}
+
+					// (2.4) record the phrases
+					wordsOfNode[idxNode] = words
+				}
+			}
+			chWorkers <- true
+		}()
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: put nodes into the input channel
+	nodes := map[int]*CitationNode{}
+	nodeIDsSent := map[int]bool{}
+	for idx, id := range g.ToBeAnalyzed {
+		// (1.1) get a node
+		node := g.Nodes[id]
+
+		// (1.2) append nodes with this node
+		nodes[idx] = node
+		nodeIDsSent[int(id)] = true
+
+		// (1.3) send nodes when nodes are large enough
+		if len(nodes) == 100 || idx+1 == len(g.ToBeAnalyzed) {
+			chNodes <- nodes
+			nodes = map[int]*CitationNode{}
+		}
+	}
+	if corpusType == 2 {
+		// send nodes not in main nodes
+		idx := len(g.ToBeAnalyzed)
+		for id, node := range g.Nodes {
+			// (1.4) skips those already sent
+			_, alreadySent := nodeIDsSent[int(id)]
+			if alreadySent {
+				continue
+			}
+
+			// (1.5) append nodes with this node
+			nodes[idx] = node
+			nodeIDsSent[int(id)] = true
+
+			// (1.6) send nodes when nodes are large enough
+			if len(nodes) == 100 {
+				chNodes <- nodes
+				nodes = map[int]*CitationNode{}
+			}
+			idx++
+		}
+		// (1.7) send the rest of nodes
+		if len(nodes) > 0 {
+			chNodes <- nodes
+		}
+	}
+	// (1.8) close channel
+	close(chNodes)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: wait for all workers
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+	for _, words := range wordsOfNode {
+		corpus.AddDoc(words)
+	}
+	return corpus
+}
+
+// =================================================================================================
+// func (g *CitationGraph) GetIdxMainNode
+func (g *CitationGraph) GetIdxMainNode(nodeID int64) uint {
+	idx, exists := g.idxMainNodes[nodeID]
+	if !exists {
+		log.Fatalln(fmt.Sprintf("cannot find %v in main node indices\n", nodeID))
+	}
+	return uint(idx)
+}
+
+// =================================================================================================
 // func (g *CitationGraph) ClusterByLDA
 // brief description: cluster the main nodes of g with their titles and their reference titles using
 //	using LDA.
@@ -1774,7 +2284,7 @@ func (g *CitationGraph) CreateCorpus(corpusType int) *Corpus {
 //	for each main node, gives the likelihoods the node belonging to a cluster.
 func (g *CitationGraph) ClusterByLDA(numTopics int, alpha, beta float64, numIters int,
 ) map[int64][]float64 {
-	if numTopics <= 0 || alpha <= 0.0 || beta <= 0.0 || numIters <= 0 {
+	if numTopics <= 0 || alpha <= 0.0 || beta <= 0.0 || numIters <= 0 { //
 		log.Fatalln("all parameters of ClusterByLDA must be > 0")
 	}
 	// ---------------------------------------------------------------------------------------------
@@ -1950,23 +2460,39 @@ func (g *CitationGraph) ClusterLabelsByWPDM(eps float64, minPts uint, simType in
 // brief description: cluster the main nodes of g with their titles and their reference titles using
 //	using LDA.
 // input:
-//	eps: the radius of neighborhood.
-//	minPts: Only if the neighborhood of a point contains at least minPt points
-//		(the center point of the neighborhood included), the neighborhood is
-//		called dense. Only dense neighborhoods are connected to communities.
 //	simType: the type of similarity, 0 for simple induced similarity, 1 for normalized
 //		similarity, 2 for jaccard similarity, 4 for weighted jaccard similarity, 4 for
 //		normalized jaccard similarity
+//	numTopics: number of topics
+//	alpha, beta: the parameters of GSDMM
+//	numIters: number of iterations
 // output:
 //	for each main node, gives the likelihoods the node belonging to a cluster.
-func (g *CitationGraph) ClusterTitlesByGSDMM(numTopics int, alpha, beta float64, numIters int,
+func (g *CitationGraph) ClusterTitlesByGSDMM(simType, numTopics int, alpha, beta float64, numIters int,
 ) map[int64][]float64 {
 	if numTopics <= 0 || alpha <= 0.0 || beta <= 0.0 || numIters <= 0 {
 		log.Fatalln("all parameters of ClusterByLDA must be > 0")
 	}
 	// ---------------------------------------------------------------------------------------------
 	// step 1: create corpus for the main nodes
-	corpus := g.CreateCorpus(0)
+	phraseSimilarities := g.GetPhraseSimilarityX(simType)
+	tfidfGroups := g.SimTFIDF(phraseSimilarities)
+	corpus := NewCorpus()
+	for _, tfidfs := range tfidfGroups {
+		texts := []string{}
+		sumWeights := 0.0
+		for _, weight := range tfidfs {
+			sumWeights += weight
+		}
+		meanWeight := sumWeights / float64(len(tfidfs))
+		for text, weight := range tfidfs {
+			if weight < 0.5*meanWeight {
+				continue
+			}
+			texts = append(texts, text)
+		}
+		corpus.AddDoc(texts)
+	}
 
 	// ---------------------------------------------------------------------------------------------
 	// step 2: use the corpus to compute LDA
@@ -2035,5 +2561,582 @@ func (g *CitationGraph) ClusterLabelsByGSDMM(numTopics int, alpha, beta float64,
 
 	// ---------------------------------------------------------------------------------------------
 	// step 4: return the result
+	return memberships
+}
+
+// =================================================================================================
+// func (g *CitationGraph) checkMemberships
+func (g *CitationGraph) checkMemberships(memberships map[int64][]float64) {
+	if len(memberships) != len(g.ToBeAnalyzed) {
+		log.Fatalln("length of memberships is incorrect.")
+	}
+
+	numDims := 0
+	for _, nodeID := range g.ToBeAnalyzed {
+		membership, exists := memberships[nodeID]
+		if !exists {
+			log.Fatalln("some nodes for analysis cannot be found in memberships")
+		}
+		if numDims == 0 {
+			numDims = len(membership)
+		} else if numDims != len(membership) {
+			log.Fatalln("number of dimensions are inconsistent in memberships")
+		}
+	}
+}
+
+// =================================================================================================
+// func (g *CitationGraph) checkCommunities
+func (g *CitationGraph) checkCommunities(communities []map[uint]bool) {
+	numNodes := 0
+	for _, community := range communities {
+		numNodes += len(community)
+	}
+	if numNodes != len(g.ToBeAnalyzed) {
+		log.Fatalln("total number of nodes in communities is incorrect.")
+	}
+}
+
+// =================================================================================================
+// func membCos
+func membCos(membershipI, membershipJ []float64) float64 {
+	if len(membershipI) != len(membershipJ) {
+		log.Fatalln("lengthes of membershipI and membershipJ don't match.")
+	}
+	sim := 0.0
+	sizeI := 0.0
+	sizeJ := 0.0
+	for k, membI := range membershipI {
+		membJ := membershipJ[k]
+		sim += membI * membJ
+		sizeI += membI * membI
+		sizeJ += membJ * membJ
+	}
+	sizeI = math.Sqrt(sizeI)
+	sizeJ = math.Sqrt(sizeJ)
+	sim /= sizeI * sizeJ
+	return sim
+}
+
+// =================================================================================================
+// func (g *CitationGraph) CompareByModularity
+func (g *CitationGraph) CompareByModularity(communities []map[uint]bool,
+	memberships map[int64][]float64) float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: check parameters
+	g.checkCommunities(communities)
+	g.checkMemberships(memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute sumSims
+	n := len(g.ToBeAnalyzed)
+	sumSims := make([]float64, n)
+	numCPUs := runtime.NumCPU()
+	chI := make(chan int)
+	chWorkers := make(chan bool)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			for i0 := range chI {
+				i1 := i0 + 100
+				if i1 > n {
+					i1 = n
+				}
+				for i := i0; i < i1; i++ {
+					nodeIDOfI := g.ToBeAnalyzed[i]
+					membershipI := memberships[nodeIDOfI]
+					sumSims[i] = 0.0
+					for _, nodeIDOfJ := range g.ToBeAnalyzed {
+						membershipJ := memberships[nodeIDOfJ]
+						sim := membCos(membershipI, membershipJ)
+						sumSims[i] += sim
+					}
+				}
+			}
+			chWorkers <- true
+		}()
+	}
+	for i := 0; i < n; i += 100 {
+		chI <- i
+	}
+	close(chI)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+	totalSumSims := 0.0
+	for i := 0; i < n; i++ {
+		totalSumSims += sumSims[i]
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: compute modularity
+	modularity := 0.0
+	for _, community := range communities {
+		for i, _ := range community {
+			nodeIDOfI := g.ToBeAnalyzed[i]
+			membershipI := memberships[nodeIDOfI]
+			for j, _ := range community {
+				nodeIDOfJ := g.ToBeAnalyzed[j]
+				membershipJ := memberships[nodeIDOfJ]
+				sim := membCos(membershipI, membershipJ)
+				modularity += sim - sumSims[i]*sumSims[j]/totalSumSims
+			}
+		}
+	}
+	modularity /= totalSumSims
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: return result
+	return modularity
+}
+
+// =================================================================================================
+// func (g *CitationGraph) CompareByCPM
+func (g *CitationGraph) CompareByCPM(gamma float64, communities []map[uint]bool,
+	memberships map[int64][]float64) float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: check parameters
+	g.checkCommunities(communities)
+	g.checkMemberships(memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute CPM
+	cpm := 0.0
+	for _, community := range communities {
+		for i, _ := range community {
+			nodeIDOfI := g.ToBeAnalyzed[i]
+			membershipI := memberships[nodeIDOfI]
+			for j, _ := range community {
+				nodeIDOfJ := g.ToBeAnalyzed[j]
+				membershipJ := memberships[nodeIDOfJ]
+				sim := membCos(membershipI, membershipJ)
+				cpm += sim - gamma
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: return result
+	return cpm
+}
+
+// =================================================================================================
+// func (g *CitationGraph) getCommunitiesFromMemberships
+func (g *CitationGraph) GetCommunitiesFromMemberships(memberships map[int64][]float64) []map[uint]bool {
+	numCommunities := 0
+	for _, membership := range memberships {
+		numCommunities = len(membership)
+		break
+	}
+	result := make([]map[uint]bool, numCommunities)
+	for i := 0; i < numCommunities; i++ {
+		result[i] = map[uint]bool{}
+	}
+	for nodeID, membership := range memberships {
+		maxMemb := 0.0
+		idxMaxMemb := 0
+		for k := 0; k < numCommunities; k++ {
+			memb := membership[k]
+			if memb > maxMemb {
+				maxMemb = memb
+				idxMaxMemb = k
+			}
+		}
+		result[idxMaxMemb][g.GetIdxMainNode(nodeID)] = true
+	}
+	return result
+}
+
+// =================================================================================================
+// func getCommunityIDFromCommunities
+func getCommunityIDsFromCommunities(n int, communities []map[uint]bool) []int {
+	result := make([]int, n)
+	for i, community := range communities {
+		for u, _ := range community {
+			result[u] = i
+		}
+	}
+	return result
+}
+
+// =================================================================================================
+// func (g *CitationGraph) CompareByRI
+func (g *CitationGraph) CompareByRI(communities []map[uint]bool,
+	memberships map[int64][]float64) float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: check parameters
+	g.checkCommunities(communities)
+	g.checkMemberships(memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute the intersection part
+	result := 0.0
+	myCommunities := g.GetCommunitiesFromMemberships(memberships)
+	for _, ci := range communities {
+		if len(ci) == 0 {
+			continue
+		}
+		for _, cj := range myCommunities {
+			if len(cj) == 0 {
+				continue
+			}
+			cu, cv := ci, cj
+			if len(cu) > len(cv) {
+				cu, cv = cv, cu
+			}
+			numInBoth := 0
+			for u, _ := range cu {
+				_, inCv := cv[u]
+				if inCv {
+					numInBoth++
+				}
+			}
+			result += float64(numInBoth * (numInBoth - 1) / 2)
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: compute the cross-boundary part
+	n := len(g.ToBeAnalyzed)
+	commuID1s := getCommunityIDsFromCommunities(n, communities)
+	commuID2s := getCommunityIDsFromCommunities(n, myCommunities)
+	for u := 0; u < n; u++ {
+		c1u := commuID1s[u]
+		c2u := commuID2s[u]
+		for v := 0; v < n; v++ {
+			c1v := commuID1s[v]
+			c2v := commuID2s[v]
+			if c1u == c1v || c2u == c2v {
+				continue
+			}
+			result += 0.5
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: normalize and return the result
+	result /= float64(n * (n - 1) / 2)
+	return result
+}
+
+// =================================================================================================
+// func (g *CitationGraph) CompareByARI
+func (g *CitationGraph) CompareByARI(communities []map[uint]bool,
+	memberships map[int64][]float64) float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: check parameters
+	g.checkCommunities(communities)
+	g.checkMemberships(memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute the intersection part
+	result := 0.0
+	myCommunities := g.GetCommunitiesFromMemberships(memberships)
+	for _, ci := range communities {
+		if len(ci) == 0 {
+			continue
+		}
+		for _, cj := range myCommunities {
+			if len(cj) == 0 {
+				continue
+			}
+			cu, cv := ci, cj
+			if len(cu) > len(cv) {
+				cu, cv = cv, cu
+			}
+			numInBoth := 0
+			for u, _ := range cu {
+				_, inCv := cv[u]
+				if inCv {
+					numInBoth++
+				}
+			}
+			result += float64(numInBoth * (numInBoth - 1) / 2)
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: compute the cross-boundary part
+	n := len(g.ToBeAnalyzed)
+	partN := float64(n * (n - 1) / 2)
+	partI := 0.0
+	for _, ci := range communities {
+		ni := len(ci)
+		if ni <= 1 {
+			continue
+		}
+		partI += float64(ni * (ni - 1) / 2)
+	}
+	partJ := 0.0
+	for _, cj := range myCommunities {
+		nj := len(cj)
+		if nj <= 1 {
+			continue
+		}
+		partJ += float64(nj * (nj - 1) / 2)
+	}
+	partCross := partI * partJ / partN
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: normalize and return the result
+	result = (result - partCross) / (0.5*(partI+partJ) - partCross)
+	return result
+}
+
+// =================================================================================================
+// func (g *CitationGraph) ComputeEntropies
+func (g *CitationGraph) ComputeEntropies(communities []map[uint]bool,
+	memberships map[int64][]float64) (float64, float64, float64) {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: check parameters
+	g.checkCommunities(communities)
+	g.checkMemberships(memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute the cross entropy
+	crossEntropy := 0.0
+	n := len(g.ToBeAnalyzed)
+	myCommunities := g.GetCommunitiesFromMemberships(memberships)
+	for _, ci := range communities {
+		if len(ci) == 0 {
+			continue
+		}
+		for _, cj := range myCommunities {
+			if len(cj) == 0 {
+				continue
+			}
+			cu, cv := ci, cj
+			if len(cu) > len(cv) {
+				cu, cv = cv, cu
+			}
+			numInBoth := 0
+			for u, _ := range cu {
+				_, inCv := cv[u]
+				if inCv {
+					numInBoth++
+				}
+			}
+			if numInBoth == 0 {
+				continue
+			}
+			p := float64(numInBoth) / float64(n)
+			crossEntropy -= p * math.Log(p)
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute the entropies
+	entropy1 := 0.0
+	for _, ci := range communities {
+		ni := len(ci)
+		if ni == 0 {
+			continue
+		}
+		p := float64(ni) / float64(n)
+		entropy1 -= p * math.Log(p)
+	}
+
+	entropy2 := 0.0
+	for _, cj := range myCommunities {
+		nj := len(cj)
+		if nj == 0 {
+			continue
+		}
+		p := float64(nj) / float64(n)
+		entropy2 -= p * math.Log(p)
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: return the entropies
+	return crossEntropy, entropy1, entropy2
+}
+
+// =================================================================================================
+// func (g *CitationGraph) CompareByMI
+func (g *CitationGraph) CompareByMI(communities []map[uint]bool,
+	memberships map[int64][]float64) float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: compute the entropies
+	crossEntropy, entropy1, entropy2 := g.ComputeEntropies(communities, memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute and return the result
+	return entropy1 + entropy2 - crossEntropy
+}
+
+// =================================================================================================
+// func (g *CitationGraph) CompareByNMI
+func (g *CitationGraph) CompareByNMI(communities []map[uint]bool,
+	memberships map[int64][]float64) float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: compute the entropies
+	crossEntropy, entropy1, entropy2 := g.ComputeEntropies(communities, memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute and return the result
+	return 2.0 * (entropy1 + entropy2 - crossEntropy) / (entropy1 + entropy2)
+}
+
+func numCombs(a ...int) float64 {
+	m := len(a)
+	m1 := m
+	for i := 0; i < m; i++ {
+		if a[i] < 0 {
+			m1 = i
+			break
+		}
+	}
+	if m1 == m {
+		log.Fatalln(fmt.Sprintf("in numComb, m1 == m\n"))
+	}
+
+	b := make([]int, m)
+	n1 := 0
+	for i := 0; i < m1; i++ {
+		b[i] = a[i]
+		n1 += a[i]
+	}
+	n2 := 0
+	for i := m1 + 1; i < m; i++ {
+		b[i] = a[i]
+		n2 += a[i]
+	}
+
+	if n1 != n2 {
+		log.Fatalln(fmt.Sprintf("in numComb, n1 = %d != n2 = %d\n", n1, n2))
+	}
+
+	result := 1.0
+	for k := 0; k < n1; k++ {
+		i1Max := 0
+		for i1 := 1; i1 < m1; i1++ {
+			if b[i1] > b[i1Max] {
+				i1Max = i1
+			}
+		}
+
+		i2Max := m1 + 1
+		for i2 := m1 + 2; i2 < m; i2++ {
+			if b[i2] > b[i2Max] {
+				i2Max = i2
+			}
+		}
+
+		result *= float64(b[i1Max]) / float64(b[i2Max])
+		b[i1Max]--
+		b[i2Max]--
+	}
+	return result
+}
+
+// =================================================================================================
+// func (g *CitationGraph) ComputeEMI
+func (g *CitationGraph) ComputeEMI(communities []map[uint]bool,
+	memberships map[int64][]float64) float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: check parameters
+	g.checkCommunities(communities)
+	g.checkMemberships(memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute the cross entropy
+	result := 0.0
+	n := len(g.ToBeAnalyzed)
+	myCommunities := g.GetCommunitiesFromMemberships(memberships)
+	for _, ci := range communities {
+		ni := len(ci)
+		if ni == 0 {
+			continue
+		}
+		for _, cj := range myCommunities {
+			nj := len(cj)
+			if nj == 0 {
+				continue
+			}
+			k0 := ni + nj - n
+			if k0 < 1 {
+				k0 = 1
+			}
+			k1 := ni
+			if k1 > nj {
+				k1 = nj
+			}
+			for k := k0; k <= k1; k++ {
+				result += numCombs(ni, nj, n-ni, n-nj, -1, n, k, ni-k, nj-k, n-ni-nj+k) *
+					float64(k) / float64(n) * math.Log(float64(k*n)/float64(ni*nj))
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: return the result
+	return result
+}
+
+// =================================================================================================
+// func (g *CitationGraph) CompareByAMI
+func (g *CitationGraph) CompareByAMI(communities []map[uint]bool,
+	memberships map[int64][]float64) float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: compute the entropies
+	crossEntropy, entropy1, entropy2 := g.ComputeEntropies(communities, memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: compute and expected mutual entropy
+	emi := g.ComputeEMI(communities, memberships)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: compute and return the result
+	mi := entropy1 + entropy2 - crossEntropy
+	return (mi - emi) / (math.Max(entropy1, entropy2) - emi)
+}
+
+// =================================================================================================
+// func SaveMemberships
+func SaveMemberships(memberships map[int64][]float64, fileName string) {
+	fileMembership, err := os.Create(fileName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	jsonBytes, err := json.Marshal(memberships)
+	if err != nil {
+		log.Fatal(err)
+	}
+	jsonString := string(jsonBytes)
+	_, err = fileMembership.WriteString(jsonString)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fileMembership.Close()
+}
+
+// =================================================================================================
+// func LoadMemberships
+
+func LoadMemberships(fileName string) map[int64][]float64 {
+	memberships := map[int64][]float64{}
+	fileMembership, err := os.Open(fileName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	bufLen := 1024 * 1024
+	bytes := make([]byte, bufLen)
+	jsonBytes := []byte{}
+	readLen, err := fileMembership.Read(bytes)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for readLen == bufLen {
+		jsonBytes = append(jsonBytes, bytes...)
+		readLen, err = fileMembership.Read(bytes)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	if readLen > 0 {
+		jsonBytes = append(jsonBytes, bytes[0:readLen]...)
+	}
+
+	fileMembership.Close()
+	json.Unmarshal(jsonBytes, &memberships)
 	return memberships
 }
