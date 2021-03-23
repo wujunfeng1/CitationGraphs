@@ -247,11 +247,98 @@ func (this *Corpus) GetConcurrences() map[uint]map[uint]float64 {
 }
 
 // =================================================================================================
+// func (this *CorpusX) GetExclusions
+// brief description: get exclusions from corpus
+func (this *CorpusX) GetExclusions() map[uint]map[uint]bool {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create empty exclusions
+	exclusions := map[uint]map[uint]bool{}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: create texts
+	numTexts := len(this.Vocab)
+	texts := make([]string, numTexts)
+	for text, id := range this.Vocab {
+		texts[id] = text
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: spawn goroutines to find exclusions when words are in the same group
+	numCPUs := runtime.NumCPU()
+	numDocs := len(this.Docs)
+	chI := make(chan int)
+	chExclusions := make(chan map[uint]map[uint]bool)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			myExclusions := map[uint]map[uint]bool{}
+			for i0 := range chI {
+				i1 := i0 + 100
+				if i1 > numDocs {
+					i1 = numDocs
+				}
+				for i := i0; i < i1; i++ {
+					wordGroups := this.Docs[i]
+					for _, wordCount := range wordGroups {
+						for w1, _ := range wordCount {
+							exclusionsOfW1, exists := myExclusions[uint(w1)]
+							if !exists {
+								exclusionsOfW1 = map[uint]bool{}
+								myExclusions[uint(w1)] = exclusionsOfW1
+							}
+							text1 := texts[w1]
+							for w2, _ := range wordCount {
+								if w2 != w1 {
+									text2 := texts[w2]
+									if KeyphraseExtraction.Overlaps(text1, text2) {
+										exclusionsOfW1[uint(w2)] = true
+									}
+								}
+							}
+						}
+					}
+
+				}
+			}
+
+			// give main thread my results
+			chExclusions <- myExclusions
+		}()
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: send tasks through chI
+	for i := 0; i < numDocs; i += 100 {
+		chI <- i
+	}
+	close(chI)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: merge results
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		myExclusions := <-chExclusions
+		for w1, deltaExclusionsOfW1 := range myExclusions {
+			exclusionsOfW1, exists := exclusions[w1]
+			if exists {
+				for w2, _ := range deltaExclusionsOfW1 {
+					exclusionsOfW1[w2] = true
+				}
+			} else {
+				exclusions[w1] = deltaExclusionsOfW1
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 6: return results
+	return exclusions
+}
+
+// =================================================================================================
 // func (this *CorpusX) GetConcurrences
 // brief description: get concurrences from corpus
 func (this *CorpusX) GetConcurrences() map[uint]map[uint]float64 {
 	// ---------------------------------------------------------------------------------------------
-	// step 1: create concurrences
+	// step 1: create empty concurrences
 	concurrences := map[uint]map[uint]float64{}
 
 	// ---------------------------------------------------------------------------------------------
@@ -1747,13 +1834,15 @@ func (g *CitationGraph) GetPhraseSimilarityX(simType int) map[string]map[string]
 	corpus := g.CreateCorpusX(2)
 
 	// --------------------------------------------------------------------------------------------
-	// step 2: get concurrences from corpuse
+	// step 2: get concurrences and exclusions from corpuse
 	concurrences := corpus.GetConcurrences()
+	exclusions := corpus.GetExclusions()
 
 	// --------------------------------------------------------------------------------------------
 	// step 3: create concurrence model from concurrences
 	cm := ConcurrenceBasedClustering.NewConcurrenceModel()
 	cm.SetConcurrences(uint(len(corpus.Vocab)), concurrences)
+	cm.SetExclusions(exclusions)
 
 	// --------------------------------------------------------------------------------------------
 	// step 4: get similarity
@@ -1786,227 +1875,6 @@ func (g *CitationGraph) GetPhraseSimilarityX(simType int) map[string]map[string]
 			rowI[wordJ] = value
 		}
 		result[wordI] = rowI
-	}
-	return result
-}
-
-// =================================================================================================
-// method GetPhraseSimilarityHSPP
-// brief description: compute the similarities between pairs of phrases and gives them in form of a
-//	sparse matrix using Hierarchical Sparse Phrase Pair method
-// input:
-// 	nothing
-// output:
-//	the sparse matrix of phrase similarities
-// note:
-//	The title link method can be found in:
-//	Bogomolova, A., Ryazanova, M., & Balk, I. (2021). Cluster approach to analysis of publication
-//	titles. In Journal of Physics: Conference Series (Vol. 1727, No. 1, p. 012016). IOP Publishing.
-func (g *CitationGraph) GetPhraseSimilarityHSPP() map[string]map[string]float64 {
-	// --------------------------------------------------------------------------------------------
-	// step 1: count the phrase-pair frequencies
-	pairFreq := map[string]map[string]uint{}
-	numCPUs := runtime.NumCPU()
-	chNodes := make(chan []*CitationNode)
-	chWorkers := make(chan bool)
-	lock := sync.RWMutex{}
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		go func(idxWorker int) {
-			// store my results in myPairFreq first, merge my results into pairFreq later
-			myPairFreq := map[string]map[string]uint{}
-			numProcessedNodes := 0
-			for nodes := range chNodes {
-				for _, node := range nodes {
-					// get phrase candidates
-					phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
-
-					// split candidates
-					wordss := [][]string{}
-					for _, candid := range phraseCandidates {
-						words := strings.Split(candid, " ")
-						wordss = append(wordss, words)
-					}
-
-					// count pair frequency
-					for idx1, words1 := range wordss {
-						n1 := len(words1)
-						for idx2, words2 := range wordss {
-							if idx2 == idx1 {
-								continue
-							}
-							n2 := len(words2)
-							for i1 := 0; i1 < n1; i1++ {
-								text1 := words1[i1]
-								row, exists := myPairFreq[text1]
-								if !exists {
-									row = map[string]uint{}
-									myPairFreq[text1] = row
-								}
-								for i2 := 0; i2 < n2; i2++ {
-									text2 := words2[i2]
-									oldFreq, exists := row[text2]
-									if !exists {
-										oldFreq = 0
-									}
-									row[text2] = oldFreq + 1
-									for j2 := i2 + 1; j2 < n2; j2++ {
-										text2 += " " + words2[j2]
-										oldFreq, exists = row[text2]
-										if !exists {
-											oldFreq = 0
-										}
-										row[text2] = oldFreq + 1
-									}
-								}
-								for j1 := i1 + 1; j1 < n1; j1++ {
-									text1 += " " + words1[j1]
-									row, exists = myPairFreq[text1]
-									if !exists {
-										row = map[string]uint{}
-										myPairFreq[text1] = row
-									}
-									for i2 := 0; i2 < n2; i2++ {
-										text2 := words2[i2]
-										oldFreq, exists := row[text2]
-										if !exists {
-											oldFreq = 0
-										}
-										row[text2] = oldFreq + 1
-										for j2 := i2 + 1; j2 < n2; j2++ {
-											text2 += " " + words2[j2]
-											oldFreq, exists = row[text2]
-											if !exists {
-												oldFreq = 0
-											}
-											row[text2] = oldFreq + 1
-										}
-									}
-								}
-							}
-						}
-					}
-
-				}
-				numProcessedNodes += len(nodes)
-				fmt.Printf("worker %d has processed %d nodes\n", idxWorker, numProcessedNodes)
-			}
-
-			// now we merge the results into pairFreq
-			// fmt.Printf("worker %d is merging results\n", idxWorker)
-			lock.Lock()
-			defer lock.Unlock()
-			for key1, value1 := range myPairFreq {
-				row, exists := pairFreq[key1]
-				if !exists {
-					pairFreq[key1] = value1
-				} else {
-					for key2, value2 := range value1 {
-						oldValue, exists := row[key2]
-						if !exists {
-							oldValue = uint(0)
-						}
-						row[key2] = oldValue + value2
-					}
-				}
-			}
-			fmt.Printf("worker %d exits\n", idxWorker)
-			chWorkers <- true
-		}(idxCPU)
-	}
-
-	nodeBatch := make([]*CitationNode, 3000)
-	idxInBatch := 0
-	for _, node := range g.Nodes {
-		nodeBatch[idxInBatch] = node
-		idxInBatch++
-		if idxInBatch == len(nodeBatch) {
-			chNodes <- nodeBatch
-			nodeBatch = make([]*CitationNode, 3000)
-			idxInBatch = 0
-		}
-	}
-	if idxInBatch > 0 {
-		nodeBatch = nodeBatch[:idxInBatch]
-		chNodes <- nodeBatch
-	}
-	close(chNodes)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		<-chWorkers
-	}
-	fmt.Println("pair frequencies counted")
-
-	// --------------------------------------------------------------------------------------------
-	// step 2: compute conditional probability
-	condProb := map[string]map[string]float64{}
-	chKeys := make(chan []string)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		go func(idxWorker int) {
-			numProcessedKeys := 0
-			myRows := map[string]map[string]float64{}
-			for keys := range chKeys {
-				for _, text1 := range keys {
-					rowFreq, _ := pairFreq[text1]
-					sumRowFreq := 0.0
-					for _, freq := range rowFreq {
-						sumRowFreq += float64(freq)
-					}
-					rowCondProb := map[string]float64{}
-					for text2, freq := range rowFreq {
-						rowCondProb[text2] = float64(freq) / sumRowFreq
-					}
-					myRows[text1] = rowCondProb
-				}
-				numProcessedKeys += len(keys)
-				fmt.Printf("worker %d has processed %d keys\n", idxWorker, numProcessedKeys)
-			}
-			lock.Lock()
-			defer lock.Unlock()
-			for key, row := range myRows {
-				condProb[key] = row
-			}
-			fmt.Printf("worker %d exits\n", idxWorker)
-			chWorkers <- true
-		}(idxCPU)
-	}
-
-	keyBatch := make([]string, 10000)
-	idxInBatch = 0
-	for key, _ := range pairFreq {
-		keyBatch[idxInBatch] = key
-		idxInBatch++
-		if idxInBatch == len(keyBatch) {
-			chKeys <- keyBatch
-			keyBatch = make([]string, 10000)
-			idxInBatch = 0
-		}
-	}
-	if idxInBatch > 0 {
-		keyBatch = keyBatch[:idxInBatch]
-		chKeys <- keyBatch
-	}
-	close(chKeys)
-	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
-		<-chWorkers
-	}
-	fmt.Println("conditional probabilities computed")
-
-	// --------------------------------------------------------------------------------------------
-	// step 3: compute the result
-	result := map[string]map[string]float64{}
-	for text1, row := range condProb {
-		result[text1] = map[string]float64{}
-		for text2, p := range row {
-			result[text1][text2] = 0.5 * p
-		}
-	}
-	for text1, row := range condProb {
-		for text2, p := range row {
-			result[text2][text1] += 0.5 * p
-		}
-	}
-	// must force the diagonals to be 1.0
-	for text, row := range result {
-		row[text] = 1.0
 	}
 	return result
 }
@@ -2769,7 +2637,7 @@ func (g *CitationGraph) CompareByRI(communities []map[uint]bool,
 
 	// ---------------------------------------------------------------------------------------------
 	// step 2: compute the intersection part
-	result := 0.0
+	partIntersect := 0.0
 	myCommunities := g.GetCommunitiesFromMemberships(memberships)
 	for _, ci := range communities {
 		if len(ci) == 0 {
@@ -2790,7 +2658,7 @@ func (g *CitationGraph) CompareByRI(communities []map[uint]bool,
 					numInBoth++
 				}
 			}
-			result += float64(numInBoth * (numInBoth - 1) / 2)
+			partIntersect += float64(numInBoth * (numInBoth - 1) / 2)
 		}
 	}
 
@@ -2799,6 +2667,7 @@ func (g *CitationGraph) CompareByRI(communities []map[uint]bool,
 	n := len(g.ToBeAnalyzed)
 	commuID1s := getCommunityIDsFromCommunities(n, communities)
 	commuID2s := getCommunityIDsFromCommunities(n, myCommunities)
+	partCross := 0.0
 	for u := 0; u < n; u++ {
 		c1u := commuID1s[u]
 		c2u := commuID2s[u]
@@ -2808,13 +2677,15 @@ func (g *CitationGraph) CompareByRI(communities []map[uint]bool,
 			if c1u == c1v || c2u == c2v {
 				continue
 			}
-			result += 0.5
+			partCross += 0.5
 		}
 	}
 
 	// ---------------------------------------------------------------------------------------------
 	// step 4: normalize and return the result
-	result /= float64(n * (n - 1) / 2)
+	partN := float64(n * (n - 1) / 2)
+	fmt.Printf("part intersect = %f, partCross = %f, partN = %f\n", partIntersect, partCross, partN)
+	result := (partIntersect + partCross) / partN
 	return result
 }
 
@@ -2875,6 +2746,8 @@ func (g *CitationGraph) CompareByARI(communities []map[uint]bool,
 		partJ += float64(nj * (nj - 1) / 2)
 	}
 	partCross := partI * partJ / partN
+
+	fmt.Printf("part intersect = %f, partCross = %f, partI = %f, partJ = %f\n", result, partCross, partI, partJ)
 
 	// ---------------------------------------------------------------------------------------------
 	// step 4: normalize and return the result
@@ -3111,7 +2984,6 @@ func SaveMemberships(memberships map[int64][]float64, fileName string) {
 
 // =================================================================================================
 // func LoadMemberships
-
 func LoadMemberships(fileName string) map[int64][]float64 {
 	memberships := map[int64][]float64{}
 	fileMembership, err := os.Open(fileName)
@@ -3139,4 +3011,87 @@ func LoadMemberships(fileName string) map[int64][]float64 {
 	fileMembership.Close()
 	json.Unmarshal(jsonBytes, &memberships)
 	return memberships
+}
+
+// =================================================================================================
+// struct PhrasePair
+type PhrasePair struct {
+	Phrase1, Phrase2 string
+}
+
+type PairFreq struct {
+	Actual   float64
+	Expected float64
+}
+
+// =================================================================================================
+// func (g *CitationGraph) preparePhrasePairSearch
+func (g *CitationGraph) preparePhrasePairSearch() (concurrences map[uint]map[uint]float64,
+	sumConcurrencesOf []float64, phrases []string) {
+	// --------------------------------------------------------------------------------------------
+	// step 1: create corpus using all nodes
+	corpus := g.CreateCorpusX(2)
+
+	// --------------------------------------------------------------------------------------------
+	// step 2: get concurrences and exclusions from corpuse
+	concurrences = corpus.GetConcurrences()
+
+	// --------------------------------------------------------------------------------------------
+	// step 3: compute sum of concurrences
+	numPhrases := uint(len(corpus.Vocab))
+	sumConcurrencesOf = ConcurrenceBasedClustering.GetSumConcurrencesOf(numPhrases, concurrences)
+
+	// --------------------------------------------------------------------------------------------
+	// step 4: create concurrence model from concurrences
+	phrases = make([]string, numPhrases)
+	for phrase, idx := range corpus.Vocab {
+		phrases[idx] = phrase
+	}
+
+	return
+}
+
+// =================================================================================================
+// func (g *CitationGraph) findStronglyConnectedPhrases
+func (g *CitationGraph) findStronglyConnectedPhrases(concurrences map[uint]map[uint]float64,
+	sumConcurrencesOf []float64, phrases []string, thresFreq, thresRatio float64,
+) map[PhrasePair]PairFreq {
+	// --------------------------------------------------------------------------------------------
+	// step 1: apply thresholds in filtering
+	n := len(g.Nodes)
+	numPhrases := len(phrases)
+	result := map[PhrasePair]PairFreq{}
+	for w1, concurrencesOfW1 := range concurrences {
+		relFreq1 := sumConcurrencesOf[w1] / float64(numPhrases)
+		for w2, freq := range concurrencesOfW1 {
+			if w1 >= w2 {
+				continue
+			}
+			if freq < thresFreq {
+				continue
+			}
+			relFreq2 := sumConcurrencesOf[w2] / float64(numPhrases)
+			expectedFreq := relFreq1 * relFreq2 * float64(n)
+			if freq >= thresRatio*expectedFreq {
+				result[PhrasePair{phrases[w1], phrases[w2]}] = PairFreq{Actual: freq, Expected: expectedFreq}
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: return the result
+	return result
+}
+
+// =================================================================================================
+// func (g *CitationGraph) GetStronglyConnectedPhrases
+func (g *CitationGraph) GetStronglyConnectedPhrases(thresFreq, thresRatio float64) map[PhrasePair]PairFreq {
+	// --------------------------------------------------------------------------------------------
+	// step 1: get concurrences, sumConcurrencesOf, and phrases
+	concurrences, sumConcurrencesOf, phrases := g.preparePhrasePairSearch()
+
+	// --------------------------------------------------------------------------------------------
+	// step 2: apply thresholds in filtering and return the result
+	return g.findStronglyConnectedPhrases(concurrences, sumConcurrencesOf, phrases, thresFreq, thresRatio)
+
 }
