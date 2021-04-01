@@ -11,22 +11,29 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/chrisport/go-lang-detector/langdet"
+	"github.com/chrisport/go-lang-detector/langdet/langdetdef"
 	"github.com/wujunfeng1/ConcurrenceBasedClustering"
 	"github.com/wujunfeng1/KeyphraseExtraction"
+	"github.com/wujunfeng1/wego/pkg/model/modelutil/vector"
+	"github.com/wujunfeng1/wego/pkg/model/word2vec"
 )
 
 var reUnicodeHex *regexp.Regexp
 var reUnicodeDec *regexp.Regexp
+var langDetector langdet.Detector
 
 func init() {
 	reUnicodeHex = regexp.MustCompile("&//[Xx]([A-Fa-f0-9])+;")
 	reUnicodeDec = regexp.MustCompile("&//([0-9])+;")
 	rand.Seed(time.Now().Unix())
+	langDetector = langdetdef.NewWithDefaultLanguages()
 }
 
 // =================================================================================================
@@ -87,6 +94,14 @@ type CorpusX struct {
 }
 
 // =================================================================================================
+// struct CorpusSeq
+// brief description: the extended corpus data structure
+type CorpusSeq struct {
+	Vocab map[string]int // the vocabulary
+	Docs  [][]int        // keys: docID, wordIdx, value: word id
+}
+
+// =================================================================================================
 // func NewCorpus
 // brief description: create an empty corpus
 func NewCorpus() *Corpus {
@@ -103,6 +118,16 @@ func NewCorpusX() *CorpusX {
 	return &CorpusX{
 		Vocab: map[string]int{},
 		Docs:  [][]map[int]int{},
+	}
+}
+
+// =================================================================================================
+// func NewCorpusSeq
+// brief description: create an empty corpus
+func NewCorpusSeq() *CorpusSeq {
+	return &CorpusSeq{
+		Vocab: map[string]int{},
+		Docs:  [][]int{},
 	}
 }
 
@@ -159,6 +184,382 @@ func (this *CorpusX) AddDoc(words [][]string) {
 	// ---------------------------------------------------------------------------------------------
 	// step 2: add the new doc into docs
 	this.Docs = append(this.Docs, doc)
+}
+
+// =================================================================================================
+// func (this *CorpusSeq) AddDoc
+// brief description: add one document to corpus with specified docId and word count list, if the
+// 	specified docId already exists in corpus, the old doc will be overwritted
+func (this *CorpusSeq) AddDoc(words []string) {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create a new doc and count word counts
+	doc := make([]int, len(words))
+	for idx, word := range words {
+		wordID, exists := this.Vocab[word]
+		if !exists {
+			wordID = len(this.Vocab)
+			this.Vocab[word] = wordID
+		}
+		doc[idx] = wordID
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: add the new doc into docs
+	this.Docs = append(this.Docs, doc)
+}
+
+// =================================================================================================
+// func (this *CorpusSeq) GetConcurrences
+// brief description: get concurrences from corpus
+func (this *CorpusSeq) GetConcurrences() map[uint]map[uint]float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create concurrences
+	concurrences := map[uint]map[uint]float64{}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: spawn goroutines to count concurrences when words are in the same document
+	numCPUs := runtime.NumCPU()
+	numDocs := len(this.Docs)
+	chI := make(chan int)
+	chWorkers := make(chan bool)
+	lock := sync.RWMutex{}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			myConcurrences := map[uint]map[uint]float64{}
+			for i0 := range chI {
+				i1 := i0 + 100
+				if i1 > numDocs {
+					i1 = numDocs
+				}
+				for i := i0; i < i1; i++ {
+					wordCount := this.Docs[i]
+					for w1, count1 := range wordCount {
+						concurrencesOfW1, exists := myConcurrences[uint(w1)]
+						if !exists {
+							concurrencesOfW1 = map[uint]float64{}
+							myConcurrences[uint(w1)] = concurrencesOfW1
+						}
+						for w2, count2 := range wordCount {
+							if w1 != w2 {
+								count, exists := concurrencesOfW1[uint(w2)]
+								if !exists {
+									count = 0.0
+								}
+								concurrencesOfW1[uint(w2)] = count + float64(count1*count2)
+							}
+						}
+					}
+				}
+			}
+
+			// now we merge the results into concurrences
+			lock.Lock()
+			defer lock.Unlock()
+			for key1, value1 := range myConcurrences {
+				row, exists := concurrences[key1]
+				if !exists {
+					concurrences[key1] = value1
+				} else {
+					for key2, value2 := range value1 {
+						oldValue, exists := row[key2]
+						if !exists {
+							oldValue = 0.0
+						}
+						row[key2] = oldValue + value2
+					}
+				}
+			}
+
+			// tell main thread that this worker finishes
+			chWorkers <- true
+		}()
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step	3: send tasks through chI
+	for i := 0; i < numDocs; i += 100 {
+		chI <- i
+	}
+	close(chI)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: wait for all workers
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: return the concurrences
+	return concurrences
+}
+
+// =================================================================================================
+// func (this *CorpusSeq) Word2Phrase
+func (this *CorpusSeq) Word2Phrase(numIters, minFreq int, minScore float64) *CorpusSeq {
+	if numIters <= 0 {
+		return this
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 1: count unigram/bigram freqs
+	freqs1 := map[int]int{}
+	freqs2 := map[int]map[int]int{}
+	for _, doc := range this.Docs {
+		for idx, wordID := range doc {
+			oldFreqUnigram, exists := freqs1[wordID]
+			if !exists {
+				oldFreqUnigram = 0
+			}
+			freqs1[wordID] = oldFreqUnigram + 1
+			if idx > 0 {
+				prevWordID := doc[idx-1]
+				freqsOfPrev, exists := freqs2[prevWordID]
+				if !exists {
+					freqsOfPrev = map[int]int{}
+					freqs2[prevWordID] = freqsOfPrev
+				}
+				oldFreqBigram, exists := freqsOfPrev[wordID]
+				if !exists {
+					oldFreqBigram = 0
+				}
+				freqsOfPrev[wordID] = oldFreqBigram + 1
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: clone the vacabulary and creat the reverse map
+	vocab := map[string]int{}
+	words := make([]string, len(this.Vocab))
+	for word, wordID := range this.Vocab {
+		vocab[word] = wordID
+		words[wordID] = word
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: compute score for all those bigrams occur at least minFreq times
+	for prevWordID, freqsOfPrev := range freqs2 {
+		for wordID, freq := range freqsOfPrev {
+			// skip those occur less than or equal to minFreq times
+			if freq <= minFreq {
+				continue
+			}
+
+			// compute score
+			score := float64(freq-minFreq) / float64(freqs1[prevWordID]*freqs1[wordID])
+
+			// skip those with small scores
+			if score < minScore {
+				continue
+			}
+
+			// put the detected phrase into vocab
+			phraseID := len(vocab)
+			phraseText := words[prevWordID] + " " + words[wordID]
+			vocab[phraseText] = phraseID
+			fmt.Printf("%s: score %f\n", phraseText, score)
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: create docs with these unigrams and selected bigrams
+	newDocs := make([][]int, len(this.Docs))
+	for idxDoc, doc := range this.Docs {
+		newDoc := []int{}
+		lenDoc := len(doc)
+		idxWord := 0
+		for idxWord < lenDoc {
+			wordID := doc[idxWord]
+
+			useBigram := true
+			if idxWord+1 < lenDoc {
+				nextWordID := doc[idxWord+1]
+				bigramFreq := freqs2[wordID][nextWordID]
+				if bigramFreq > minFreq {
+					score := float64(bigramFreq-minFreq) /
+						float64(freqs1[wordID]*freqs1[nextWordID])
+					if score < minScore {
+						useBigram = false
+					}
+				} else {
+					useBigram = false
+				}
+			} else {
+				useBigram = false
+			}
+
+			if useBigram {
+				nextWordID := doc[idxWord+1]
+				bigramText := words[wordID] + " " + words[nextWordID]
+				phraseID, exists := vocab[bigramText]
+				if !exists {
+					log.Fatalln("corrupted vocab")
+				}
+				newDoc = append(newDoc, phraseID)
+				idxWord += 2
+			} else {
+				newDoc = append(newDoc, wordID)
+				idxWord++
+			}
+		}
+		newDocs[idxDoc] = newDoc
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: create a new corpus with unigrams and selected bigrams
+	newCorpus := &CorpusSeq{Vocab: vocab, Docs: newDocs}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 6: return the result
+	if numIters == 1 {
+		return newCorpus
+	} else {
+		return newCorpus.Word2Phrase(numIters-1, minFreq, minScore)
+	}
+}
+
+// =================================================================================================
+// func (this *CorpusSeq) Word2PhraseEx
+func (this *CorpusSeq) Word2PhraseEx(numIters, minFreq int, minScore float64) *CorpusSeq {
+	if numIters <= 0 {
+		return this
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 1: count unigram/bigram freqs
+	freqs1 := map[int]int{}
+	freqs2 := map[int]map[int]int{}
+	freqs3 := map[int]map[int]int{}
+	for _, doc := range this.Docs {
+		for idx, wordID := range doc {
+			oldFreqUnigram, exists := freqs1[wordID]
+			if !exists {
+				oldFreqUnigram = 0
+			}
+			freqs1[wordID] = oldFreqUnigram + 1
+			if idx > 0 {
+				prevWordID := doc[idx-1]
+				freqsOfPrev, exists := freqs2[prevWordID]
+				if !exists {
+					freqsOfPrev = map[int]int{}
+					freqs2[prevWordID] = freqsOfPrev
+				}
+				oldFreqBigram, exists := freqsOfPrev[wordID]
+				if !exists {
+					oldFreqBigram = 0
+				}
+				freqsOfPrev[wordID] = oldFreqBigram + 1
+
+				freqsOfCurr, exists := freqs3[wordID]
+				if !exists {
+					freqsOfCurr = map[int]int{}
+					freqs3[wordID] = freqsOfCurr
+				}
+				oldFreqBigramRev, exists := freqsOfCurr[prevWordID]
+				if !exists {
+					oldFreqBigramRev = 0
+				}
+				freqsOfCurr[prevWordID] = oldFreqBigramRev + 1
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: clone the vacabulary and creat the reverse map
+	vocab := map[string]int{}
+	words := make([]string, len(this.Vocab))
+	for word, wordID := range this.Vocab {
+		vocab[word] = wordID
+		words[wordID] = word
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: compute score for all those bigrams occur at least minFreq times
+	for prevWordID, freqsOfPrev := range freqs2 {
+		for wordID, freq := range freqsOfPrev {
+			// skip those occur less than or equal to minFreq times
+			if freq <= minFreq {
+				continue
+			}
+
+			// compute score
+			cond1 := float64(freq) / float64(freqs1[prevWordID])
+			cond2 := float64(freq) / float64(freqs1[wordID])
+			avg1 := 1.0 / float64(len(freqs2[prevWordID]))
+			avg2 := 1.0 / float64(len(freqs3[wordID]))
+			score := cond1 * cond2 / (avg1 * avg2)
+
+			// skip those with small scores
+			if score < minScore {
+				continue
+			}
+
+			// put the detected phrase into vocab
+			phraseID := len(vocab)
+			phraseText := words[prevWordID] + " " + words[wordID]
+			vocab[phraseText] = phraseID
+			//fmt.Printf("%s: score %f\n", phraseText, score)
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: create docs with these unigrams and selected bigrams
+	newDocs := make([][]int, len(this.Docs))
+	for idxDoc, doc := range this.Docs {
+		newDoc := []int{}
+		lenDoc := len(doc)
+		idxWord := 0
+		for idxWord < lenDoc {
+			wordID := doc[idxWord]
+
+			useBigram := true
+			if idxWord+1 < lenDoc {
+				nextWordID := doc[idxWord+1]
+				bigramFreq := freqs2[wordID][nextWordID]
+				if bigramFreq > minFreq {
+					cond1 := float64(bigramFreq) / float64(freqs1[wordID])
+					cond2 := float64(bigramFreq) / float64(freqs1[nextWordID])
+					avg1 := 1.0 / float64(len(freqs2[wordID]))
+					avg2 := 1.0 / float64(len(freqs3[nextWordID]))
+					score := cond1 * cond2 / (avg1 * avg2)
+					if score < minScore {
+						useBigram = false
+					}
+				} else {
+					useBigram = false
+				}
+			} else {
+				useBigram = false
+			}
+
+			if useBigram {
+				nextWordID := doc[idxWord+1]
+				bigramText := words[wordID] + " " + words[nextWordID]
+				phraseID, exists := vocab[bigramText]
+				if !exists {
+					log.Fatalln("corrupted vocab")
+				}
+				newDoc = append(newDoc, phraseID)
+				idxWord += 2
+			} else {
+				newDoc = append(newDoc, wordID)
+				idxWord++
+			}
+		}
+		newDocs[idxDoc] = newDoc
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: create a new corpus with unigrams and selected bigrams
+	newCorpus := &CorpusSeq{Vocab: vocab, Docs: newDocs}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 6: return the result
+	if numIters == 1 {
+		return newCorpus
+	} else {
+		return newCorpus.Word2PhraseEx(numIters-1, minFreq, minScore)
+	}
 }
 
 // =================================================================================================
@@ -378,6 +779,104 @@ func (this *CorpusX) GetConcurrences() map[uint]map[uint]float64 {
 											count = 0.0
 										}
 										concurrencesOfW1[uint(w2)] = count + float64(count1*count2)
+									}
+								}
+							}
+						}
+					}
+
+				}
+			}
+
+			// now we merge the results into concurrences
+			lock.Lock()
+			defer lock.Unlock()
+			for key1, value1 := range myConcurrences {
+				row, exists := concurrences[key1]
+				if !exists {
+					concurrences[key1] = value1
+				} else {
+					for key2, value2 := range value1 {
+						oldValue, exists := row[key2]
+						if !exists {
+							oldValue = 0.0
+						}
+						row[key2] = oldValue + value2
+					}
+				}
+			}
+
+			// tell main thread that this worker finishes
+			chWorkers <- true
+		}()
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step	3: send tasks through chI
+	for i := 0; i < numDocs; i += 100 {
+		chI <- i
+	}
+	close(chI)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: wait for all workers
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: return the concurrences
+	return concurrences
+}
+
+// =================================================================================================
+// func (this *CorpusX) GetConcurrences
+// brief description: get concurrences from corpus
+func (this *CorpusX) GetDocConcurrences() map[uint]map[uint]float64 {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create empty concurrences
+	concurrences := map[uint]map[uint]float64{}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: spawn goroutines to count concurrences when words are in the same document
+	numCPUs := runtime.NumCPU()
+	numDocs := len(this.Docs)
+	chI := make(chan int)
+	chWorkers := make(chan bool)
+	lock := sync.RWMutex{}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			myConcurrences := map[uint]map[uint]float64{}
+			for i0 := range chI {
+				i1 := i0 + 100
+				if i1 > numDocs {
+					i1 = numDocs
+				}
+				for i := i0; i < i1; i++ {
+					wordGroups := this.Docs[i]
+					for idx1, wordCount1 := range wordGroups {
+						for w1, _ := range wordCount1 {
+							concurrencesOfW1, exists := myConcurrences[uint(w1)]
+							visited := map[int]bool{}
+							if !exists {
+								concurrencesOfW1 = map[uint]float64{}
+								myConcurrences[uint(w1)] = concurrencesOfW1
+							}
+							for idx2, wordCount2 := range wordGroups {
+								// skip same word group
+								if idx1 == idx2 {
+									continue
+								}
+
+								for w2, _ := range wordCount2 {
+									_, w2Visited := visited[w2]
+									if w1 != w2 && !w2Visited {
+										count, exists := concurrencesOfW1[uint(w2)]
+										if !exists {
+											count = 0.0
+										}
+										concurrencesOfW1[uint(w2)] = count + 1.0
+										visited[w2] = true
 									}
 								}
 							}
@@ -1938,11 +2437,9 @@ func (g *CitationGraph) CreateCorpus(corpusType int) *Corpus {
 
 					// (2.4) stem labels of the node and put them in phrase list
 					if corpusType == 3 {
-						for _, label := range node.Labels {
-							phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(label)
-							for _, candidate := range phraseCandidates {
-								words = append(words, candidate)
-							}
+						stemmedLabels := KeyphraseExtraction.StemPhrases(node.Labels)
+						for _, stemmedLabel := range stemmedLabels {
+							words = append(words, stemmedLabel)
 						}
 					}
 
@@ -2128,6 +2625,153 @@ func (g *CitationGraph) CreateCorpusX(corpusType int) *CorpusX {
 		corpus.AddDoc(words)
 	}
 	return corpus
+}
+
+// =================================================================================================
+// func (g *CitationGraph) CreateCorpusSeq
+// brief description: create a corpus from a citation graph
+// input
+//	corpusType:
+//		0 for title + ref titles per document for main nodes,
+//		1 for title per document for main nodes,
+//		2 for title per document for all nodes,
+//		3 for labels per document for main nodes,
+func (g *CitationGraph) CreateCorpusSeq(corpusType int) (corpus *CorpusSeq, years []int,
+	nodeIDs []int64, isEnglish []bool) {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create an empty corpus and the array for years
+	corpus = NewCorpusSeq()
+	numNodes := len(g.ToBeAnalyzed)
+	if corpusType == 2 {
+		numNodes = len(g.Nodes)
+	}
+	years = make([]int, numNodes)
+	nodeIDs = make([]int64, numNodes)
+	isEnglish = make([]bool, numNodes)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: create goroutines to add documents to the corpuse
+	numCPUs := runtime.NumCPU()
+	chNodes := make(chan map[int]*CitationNode)
+	chWorkers := make(chan bool)
+	wordsOfNode := make([][]string, numNodes)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			for nodes := range chNodes {
+				for idxNode, node := range nodes {
+					// (2.1) create an empty phrase list
+					words := []string{}
+
+					// (2.2) extract words of phrases in title and put them in the phrase list
+					if corpusType <= 2 {
+						phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(node.Title)
+						for _, candidate := range phraseCandidates {
+							candidateWords := strings.Split(candidate, " ")
+							for _, word := range candidateWords {
+								words = append(words, word)
+							}
+						}
+					}
+
+					// (2.3) extract words of phrases in reference titles and put them in the
+					// phrase list
+					if corpusType <= 0 {
+						for _, refID := range node.Refs {
+							refNode := g.Nodes[refID]
+							phraseCandidates := KeyphraseExtraction.ExtractKeyPhraseCandidates(refNode.Title)
+							for _, candidate := range phraseCandidates {
+								candidateWords := strings.Split(candidate, " ")
+								for _, word := range candidateWords {
+									words = append(words, word)
+								}
+							}
+						}
+					}
+
+					// (2.4) stem labels of the node and put them in phrase list
+					if corpusType == 3 {
+						stemmedLabels := KeyphraseExtraction.StemPhrases(node.Labels)
+						for _, stemmedLabel := range stemmedLabels {
+							words = append(words, stemmedLabel)
+						}
+					}
+
+					// (2.5) record the phrases
+					if !isEnglish[idxNode] {
+						lang := langDetector.GetClosestLanguage(strings.ToLower(node.Title))
+						if lang == "english" {
+							isEnglish[idxNode] = true
+						}
+					}
+					wordsOfNode[idxNode] = words
+				}
+			}
+			chWorkers <- true
+		}()
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: put nodes into the input channel
+	nodes := map[int]*CitationNode{}
+	nodeIDsSent := map[int]bool{}
+	for idx, id := range g.ToBeAnalyzed {
+		// (1.1) get a node and record its year
+		node := g.Nodes[id]
+		years[idx] = int(node.Year)
+		nodeIDs[idx] = id
+		isEnglish[idx] = true
+
+		// (1.2) append nodes with this node
+		nodes[idx] = node
+		nodeIDsSent[int(id)] = true
+
+		// (1.3) send nodes when nodes are large enough
+		if len(nodes) == 100 || idx+1 == len(g.ToBeAnalyzed) {
+			chNodes <- nodes
+			nodes = map[int]*CitationNode{}
+		}
+	}
+	if corpusType == 2 {
+		// send nodes not in main nodes
+		idx := len(g.ToBeAnalyzed)
+		for id, node := range g.Nodes {
+			// (1.4) skips those already sent
+			_, alreadySent := nodeIDsSent[int(id)]
+			if alreadySent {
+				continue
+			}
+
+			// (1.5) append nodes with this node and record its year
+			nodes[idx] = node
+			nodeIDsSent[int(id)] = true
+			years[idx] = int(node.Year)
+			isEnglish[idx] = false
+			nodeIDs[idx] = id
+
+			// (1.6) send nodes when nodes are large enough
+			if len(nodes) == 100 {
+				chNodes <- nodes
+				nodes = map[int]*CitationNode{}
+			}
+			idx++
+		}
+		// (1.7) send the rest of nodes
+		if len(nodes) > 0 {
+			chNodes <- nodes
+		}
+	}
+	// (1.8) close channel
+	close(chNodes)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: wait for all workers
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		<-chWorkers
+	}
+	for _, words := range wordsOfNode {
+		corpus.AddDoc(words)
+	}
+	return
 }
 
 // =================================================================================================
@@ -3026,20 +3670,71 @@ type PairFreq struct {
 
 // =================================================================================================
 // func (g *CitationGraph) preparePhrasePairSearch
-func (g *CitationGraph) preparePhrasePairSearch() (concurrences map[uint]map[uint]float64,
-	sumConcurrencesOf []float64, phrases []string) {
+func (g *CitationGraph) preparePhrasePairSearch() (numDocs int,
+	docConcurrences map[uint]map[uint]float64, docFreqsOf []float64, phrases []string) {
 	// --------------------------------------------------------------------------------------------
 	// step 1: create corpus using all nodes
 	corpus := g.CreateCorpusX(2)
 
 	// --------------------------------------------------------------------------------------------
 	// step 2: get concurrences and exclusions from corpuse
-	concurrences = corpus.GetConcurrences()
+	docConcurrences = corpus.GetDocConcurrences()
 
 	// --------------------------------------------------------------------------------------------
-	// step 3: compute sum of concurrences
-	numPhrases := uint(len(corpus.Vocab))
-	sumConcurrencesOf = ConcurrenceBasedClustering.GetSumConcurrencesOf(numPhrases, concurrences)
+	// step 3: compute sum of document frequencies for each phrase
+	numPhrases := len(corpus.Vocab)
+	docFreqsOf = make([]float64, numPhrases)
+	for i := 0; i < numPhrases; i++ {
+		docFreqsOf[i] = 0.0
+	}
+	numCPUs := runtime.NumCPU()
+	numDocs = len(corpus.Docs)
+	chI := make(chan int)
+	chResult := make(chan map[int]int)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			myResult := map[int]int{}
+
+			for i0 := range chI {
+				i1 := i0 + 100
+				if i1 > numDocs {
+					i1 = numDocs
+				}
+				for i := i0; i < i1; i++ {
+					candidates := corpus.Docs[i]
+
+					// first find the set of texts in this document
+					docResult := map[int]bool{}
+					for _, candidate := range candidates {
+						for wordID, _ := range candidate {
+							docResult[wordID] = true
+						}
+					}
+
+					// then update my document frequency with this set
+					for wordID, _ := range docResult {
+						oldFreq, exists := myResult[wordID]
+						if !exists {
+							oldFreq = 0
+						}
+						myResult[wordID] = oldFreq + 1
+					}
+				}
+			}
+
+			chResult <- myResult
+		}()
+	}
+	for i := 0; i < numDocs; i += 100 {
+		chI <- i
+	}
+	close(chI)
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		localResult := <-chResult
+		for wordID, freq := range localResult {
+			docFreqsOf[wordID] += float64(freq)
+		}
+	}
 
 	// --------------------------------------------------------------------------------------------
 	// step 4: create concurrence model from concurrences
@@ -3053,16 +3748,16 @@ func (g *CitationGraph) preparePhrasePairSearch() (concurrences map[uint]map[uin
 
 // =================================================================================================
 // func (g *CitationGraph) findStronglyConnectedPhrases
-func (g *CitationGraph) findStronglyConnectedPhrases(concurrences map[uint]map[uint]float64,
-	sumConcurrencesOf []float64, phrases []string, thresFreq, thresRatio float64,
+func (g *CitationGraph) findStronglyConnectedPhrases(numDocs int,
+	docConcurrences map[uint]map[uint]float64, docFreqsOf []float64, phrases []string,
+	thresFreq, thresRatio float64,
 ) map[PhrasePair]PairFreq {
 	// --------------------------------------------------------------------------------------------
 	// step 1: apply thresholds in filtering
 	n := len(g.Nodes)
-	numPhrases := len(phrases)
 	result := map[PhrasePair]PairFreq{}
-	for w1, concurrencesOfW1 := range concurrences {
-		relFreq1 := sumConcurrencesOf[w1] / float64(numPhrases)
+	for w1, concurrencesOfW1 := range docConcurrences {
+		relFreq1 := docFreqsOf[w1] / float64(numDocs)
 		for w2, freq := range concurrencesOfW1 {
 			if w1 >= w2 {
 				continue
@@ -3070,10 +3765,11 @@ func (g *CitationGraph) findStronglyConnectedPhrases(concurrences map[uint]map[u
 			if freq < thresFreq {
 				continue
 			}
-			relFreq2 := sumConcurrencesOf[w2] / float64(numPhrases)
+			relFreq2 := docFreqsOf[w2] / float64(numDocs)
 			expectedFreq := relFreq1 * relFreq2 * float64(n)
 			if freq >= thresRatio*expectedFreq {
-				result[PhrasePair{phrases[w1], phrases[w2]}] = PairFreq{Actual: freq, Expected: expectedFreq}
+				result[PhrasePair{phrases[w1], phrases[w2]}] =
+					PairFreq{Actual: freq, Expected: expectedFreq}
 			}
 		}
 	}
@@ -3088,10 +3784,548 @@ func (g *CitationGraph) findStronglyConnectedPhrases(concurrences map[uint]map[u
 func (g *CitationGraph) GetStronglyConnectedPhrases(thresFreq, thresRatio float64) map[PhrasePair]PairFreq {
 	// --------------------------------------------------------------------------------------------
 	// step 1: get concurrences, sumConcurrencesOf, and phrases
-	concurrences, sumConcurrencesOf, phrases := g.preparePhrasePairSearch()
+	numDocs, docConcurrences, docFreqsOf, phrases := g.preparePhrasePairSearch()
 
 	// --------------------------------------------------------------------------------------------
 	// step 2: apply thresholds in filtering and return the result
-	return g.findStronglyConnectedPhrases(concurrences, sumConcurrencesOf, phrases, thresFreq, thresRatio)
+	return g.findStronglyConnectedPhrases(numDocs, docConcurrences, docFreqsOf, phrases, thresFreq, thresRatio)
 
+}
+
+// =================================================================================================
+// func (g *CitationGraph) SaveWord2VecTrainingData
+// brief description:
+// 	save tokenized and stemmed publication titles to a file for training of word2vec
+func (g *CitationGraph) SaveWord2VecTrainingData(fileNamePrefix string, numIters, minFreq int,
+	minScore float64, useW2PEx bool, yearStartFrom int) {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create the sequential corpus
+	corpus, years, IDs, isEnglish := g.CreateCorpusSeq(2)
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: use word2phrase to detect multi-word phrases
+	if useW2PEx {
+		corpus = corpus.Word2PhraseEx(numIters, minFreq, minScore)
+	} else {
+		corpus = corpus.Word2Phrase(numIters, minFreq, minScore)
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: extract a list of phrases from corpus
+	words := make([]string, len(corpus.Vocab))
+	for word, idxWord := range corpus.Vocab {
+		words[idxWord] = word
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 4: detect year ranges
+	minYear := years[0]
+	maxYear := years[0]
+	lenYears := len(years)
+	for idxYear := 1; idxYear < lenYears; idxYear++ {
+		if years[idxYear] < minYear {
+			minYear = years[idxYear]
+		} else if years[idxYear] > maxYear {
+			maxYear = years[idxYear]
+		}
+	}
+	if minYear < yearStartFrom {
+		minYear = yearStartFrom
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 5: create a file for each [minYear, year] range
+	for year := minYear; year <= maxYear; year++ {
+		// (5.1) create the file
+		fileName := fileNamePrefix + fmt.Sprintf("-%d.txt", year)
+		idFileName := fileNamePrefix + fmt.Sprintf("-IDs-%d.txt", year)
+		file, err := os.Create(fileName)
+		if err != nil {
+			log.Fatalln(fmt.Sprintf("cannot create file %s", fileName))
+		}
+		defer file.Close()
+		idFile, err := os.Create(idFileName)
+		if err != nil {
+			log.Fatalln(fmt.Sprintf("cannot create file %s", idFileName))
+		}
+		defer idFile.Close()
+
+		// (5.2) write the file
+		for idxDoc, doc := range corpus.Docs {
+			if years[idxDoc] > year || !isEnglish[idxDoc] {
+				continue
+			}
+			for _, idxWord := range doc {
+				word := strings.Replace(words[idxWord], " ", "_", -1)
+				file.WriteString(word + " ")
+			}
+			file.WriteString("\n")
+			idFile.WriteString(fmt.Sprintf("%d\n", IDs[idxDoc]))
+		}
+	}
+}
+
+// =================================================================================================
+// func (g *CitationGraph) GetEmergingTrends
+func (g *CitationGraph) GetEmergingTrends(yearToday, yearRecent, yearFarAway, lowThreshold,
+	highThreshold int) map[string][]int {
+	if yearToday <= yearRecent || yearRecent <= yearFarAway {
+		log.Fatal("Must make sure yearFarAway < yearRecent < yearToday")
+	}
+
+	result := map[string][]int{}
+	numYears := yearToday - yearFarAway + 1
+	numYearsFarAway := yearRecent - yearFarAway
+	for _, nodeID := range g.ToBeAnalyzed {
+		node := g.Nodes[int64(nodeID)]
+		year := int(node.Year)
+		if year < yearFarAway || year > yearToday {
+			continue
+		}
+		stemmedLabels := KeyphraseExtraction.StemPhrases(node.Labels)
+		for _, label := range stemmedLabels {
+			labelHistory, exists := result[label]
+			if !exists {
+				labelHistory = make([]int, numYears)
+				result[label] = labelHistory
+				for i := 0; i < numYears; i++ {
+					labelHistory[i] = 0
+				}
+			}
+			labelHistory[year-yearFarAway]++
+		}
+	}
+
+	toBeDeleted := map[string]bool{}
+	for label, labelHistory := range result {
+		countFarAway := 0
+		for i := 0; i < numYearsFarAway; i++ {
+			countFarAway += labelHistory[i]
+		}
+		if countFarAway >= lowThreshold {
+			toBeDeleted[label] = true
+			continue
+		}
+
+		countRecent := 0
+		for i := numYearsFarAway; i < numYears; i++ {
+			countRecent += labelHistory[i]
+		}
+		if countRecent < highThreshold {
+			toBeDeleted[label] = true
+		}
+	}
+
+	for label, _ := range toBeDeleted {
+		delete(result, label)
+	}
+
+	return result
+}
+
+// =================================================================================================
+// func (g *CitationGraph) GetEmergingTopicPublications
+// note: The publications of emerging topic have the following characteristics:
+//	(1) cold start: in the year of publication, it receives citations <= lowThreshold per year
+//	(2) break out: in recent years, it receives avg citations >= highThreshold per year
+func (g *CitationGraph) GetEmergingTopicPublications(yearToday, yearRecent, yearFarAway,
+	lowThreshold, highThreshold int) map[int64][]int {
+	if yearToday <= yearRecent || yearRecent <= yearFarAway {
+		log.Fatal("Must make sure yearFarAway < yearRecent < yearToday")
+	}
+
+	result := map[int64][]int{}
+	numYears := yearToday - yearFarAway + 1
+	for _, nodeID := range g.ToBeAnalyzed {
+		node := g.Nodes[int64(nodeID)]
+		year := int(node.Year)
+
+		if year < yearFarAway || year > yearToday {
+			continue
+		}
+
+		citeHistory := make([]int, numYears)
+		result[nodeID] = citeHistory
+		for i := 0; i < numYears; i++ {
+			citeHistory[i] = 0
+		}
+
+		for _, citeID := range node.Cites {
+			citer := g.Nodes[citeID]
+			citeYear := int(citer.Year)
+			if citeYear < yearFarAway || citeYear > yearToday {
+				continue
+			}
+			citeHistory[citeYear-yearFarAway]++
+		}
+	}
+
+	toBeDeleted := map[int64]bool{}
+	for nodeID, citeHistory := range result {
+		// find cold start
+		node := g.Nodes[int64(nodeID)]
+		year := int(node.Year)
+		if citeHistory[year-yearFarAway] > lowThreshold {
+			toBeDeleted[nodeID] = true
+			continue
+		}
+		coldYear := year
+		for coldYear+1 < yearToday {
+			if citeHistory[coldYear+1-yearFarAway] <= lowThreshold {
+				coldYear++
+			} else {
+				break
+			}
+		}
+
+		// skip those cold year ends at next year of publication
+		if coldYear-year < 2 {
+			toBeDeleted[nodeID] = true
+			continue
+		}
+
+		// skip those cold year ends before yearRecent and those no hot year
+		if coldYear < yearRecent || coldYear >= yearToday {
+			toBeDeleted[nodeID] = true
+			continue
+		}
+
+		// compute hot year average
+		hotYearAvg := 0.0
+		numHotYears := 0
+		for hotYear := coldYear + 1; hotYear <= yearToday; hotYear++ {
+			hotYearAvg += float64(citeHistory[hotYear-yearFarAway])
+			numHotYears++
+		}
+		hotYearAvg /= float64(numHotYears)
+
+		// skip those with too low average during hot years
+		if hotYearAvg < float64(highThreshold) {
+			toBeDeleted[nodeID] = true
+		}
+	}
+
+	for nodeID, _ := range toBeDeleted {
+		delete(result, nodeID)
+	}
+
+	return result
+}
+
+// =================================================================================================
+// func (g *CitationGraph) GetHotTopicPublications
+// note: The publications of hot topic have the following characteristics:
+//	hot start: in the year of publication or next year, it receives citations >= highThreshold per year
+func (g *CitationGraph) GetHotTopicPublications(yearToday, yearRecent, yearFarAway,
+	lowThreshold, highThreshold int) map[int64][]int {
+	if yearToday <= yearRecent || yearRecent <= yearFarAway {
+		log.Fatal("Must make sure yearFarAway < yearRecent < yearToday")
+	}
+
+	result := map[int64][]int{}
+	numYears := yearToday - yearFarAway + 1
+	for _, nodeID := range g.ToBeAnalyzed {
+		node := g.Nodes[int64(nodeID)]
+		year := int(node.Year)
+
+		if year < yearFarAway || year > yearToday {
+			continue
+		}
+
+		citeHistory := make([]int, numYears)
+		result[nodeID] = citeHistory
+		for i := 0; i < numYears; i++ {
+			citeHistory[i] = 0
+		}
+
+		for _, citeID := range node.Cites {
+			citer := g.Nodes[citeID]
+			citeYear := int(citer.Year)
+			if citeYear < yearFarAway || citeYear > yearToday || citeYear < year {
+				continue
+			}
+			citeHistory[citeYear-yearFarAway]++
+		}
+	}
+
+	toBeDeleted := map[int64]bool{}
+	for nodeID, citeHistory := range result {
+		// find hot start
+		node := g.Nodes[int64(nodeID)]
+		year := int(node.Year)
+		if citeHistory[year-yearFarAway] < highThreshold {
+			if year+1 <= yearToday {
+				if citeHistory[year+1-yearFarAway] < highThreshold {
+					toBeDeleted[nodeID] = true
+					continue
+				}
+			} else {
+				toBeDeleted[nodeID] = true
+				continue
+			}
+
+		}
+	}
+
+	for nodeID, _ := range toBeDeleted {
+		delete(result, nodeID)
+	}
+
+	return result
+}
+
+// =================================================================================================
+// func (g *CitationGraph) SortByYear
+// brief description: return a sorted list of titles
+// input:
+//	None
+// output:
+//	A map with year as key and slice of titles as value.
+func (g *CitationGraph) SortByYear() map[int][]string {
+	// ---------------------------------------------------------------------------------------------
+	// step 1: create an empty map of the result
+	result := map[int][]string{}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 2: iterate through the citation graph and put titles into result according to year
+	for _, node := range g.Nodes {
+		year := int(node.Year)
+		resultOfYear, exists := result[year]
+		if !exists {
+			resultOfYear = []string{}
+		}
+		result[year] = append(resultOfYear, node.Title)
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// step 3: return the result
+	return result
+}
+
+func (g *CitationGraph) Word2Vec(fileNamePrefix string, numIters, minFreq int,
+	minScore float64, useW2PEx bool, yearStartFrom, yearEndWith int) {
+	g.SaveWord2VecTrainingData(fileNamePrefix, numIters, minFreq, minScore, useW2PEx, yearStartFrom)
+
+	for year := yearStartFrom; year <= yearEndWith; year++ {
+		model, err := word2vec.New(
+			word2vec.Window(5),
+			word2vec.Model(word2vec.Cbow),
+			word2vec.Optimizer(word2vec.NegativeSampling),
+			word2vec.NegativeSampleSize(5),
+			word2vec.Dim(100),
+			word2vec.Iter(100),
+			//word2vec.Verbose(),
+			word2vec.LogBatch(10000),
+		)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		inputFileName := fileNamePrefix + fmt.Sprintf("-%d.txt", year)
+		input, _ := os.Open(inputFileName)
+		defer input.Close()
+		if err = model.Train(input); err != nil {
+			log.Fatalln(err)
+		}
+
+		// write word vector.
+		outputFileName := fileNamePrefix + fmt.Sprintf("-cbow-%d.vec", year)
+		output, _ := os.Create(outputFileName)
+		model.Save(output, vector.Agg)
+	}
+
+}
+
+func computePhraseSimilarities(phraseVectors map[string][]float64, highFreqPhrases map[string]bool,
+) map[string]map[string]float64 {
+	chPhrases := make(chan []string)
+	chSimilarities := make(chan map[string]map[string]float64)
+	numCPUs := runtime.NumCPU()
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		go func() {
+			mySimilarities := map[string]map[string]float64{}
+			for phrases := range chPhrases {
+				for _, phrase := range phrases {
+					vector, _ := phraseVectors[phrase]
+					simToPhrase := map[string]float64{}
+					mySimilarities[phrase] = simToPhrase
+					for another, anotherVector := range phraseVectors {
+						_, isHighFreq := highFreqPhrases[another]
+						if !isHighFreq {
+							continue
+						}
+
+						sim := 0.0
+						size1 := 0.0
+						size2 := 0.0
+						for idx, elem := range vector {
+							anotherElem := anotherVector[idx]
+							sim += elem * anotherElem
+							size1 += elem * elem
+							size2 += anotherElem * anotherElem
+						}
+						sim /= math.Sqrt(size1 * size2)
+						simToPhrase[another] = sim
+					}
+				}
+			}
+			chSimilarities <- mySimilarities
+		}()
+	}
+
+	phrases := make([]string, 100)
+	idxPhrase := 0
+	for phrase, _ := range phraseVectors {
+		_, isHighFreq := highFreqPhrases[phrase]
+		if !isHighFreq {
+			continue
+		}
+
+		phrases[idxPhrase] = phrase
+		idxPhrase++
+		if idxPhrase == 100 {
+			chPhrases <- phrases
+			phrases = make([]string, 100)
+			idxPhrase = 0
+		}
+	}
+	if idxPhrase > 0 {
+		chPhrases <- phrases[0:idxPhrase]
+	}
+	close(chPhrases)
+
+	similarities := map[string]map[string]float64{}
+	for idxCPU := 0; idxCPU < numCPUs; idxCPU++ {
+		localSimilarities := <-chSimilarities
+		for phrase, simToPhrase := range localSimilarities {
+			similarities[phrase] = simToPhrase
+		}
+	}
+	return similarities
+}
+
+func computeSimRanks(similarities map[string]map[string]float64) map[string]map[string]int {
+	result := map[string]map[string]int{}
+	for phrase1, simToPhrase1 := range similarities {
+		numNeighbors := len(simToPhrase1) - 1
+		neighbors := make([]string, numNeighbors)
+		idxNeighbor := 0
+		for phrase2, _ := range simToPhrase1 {
+			if phrase2 == phrase1 {
+				continue
+			}
+			neighbors[idxNeighbor] = phrase2
+			idxNeighbor++
+		}
+		sort.Slice(neighbors, func(i, j int) bool {
+			return simToPhrase1[neighbors[i]] > simToPhrase1[neighbors[j]]
+		})
+		resultOfPhrase1 := map[string]int{}
+		for idx, neighbor := range neighbors {
+			resultOfPhrase1[neighbor] = idx
+		}
+		result[phrase1] = resultOfPhrase1
+	}
+	return result
+}
+
+type RankJump struct {
+	phrase1, phrase2 string
+	jump             int
+}
+
+func (g *CitationGraph) Leap2Trend(fileNamePrefix string, yearStartFrom, yearEndWith, minFreq, minJump int) {
+	prevSimRanks := map[string]map[string]int{}
+	for year := yearStartFrom; year <= yearEndWith; year++ {
+		// open vector file and id file
+		vectorFileName := fileNamePrefix + fmt.Sprintf("-cbow-%d.vec", year)
+		idFileName := fileNamePrefix + fmt.Sprintf("-IDs-%d.txt", year)
+		trainFileName := fileNamePrefix + fmt.Sprintf("-%d.txt", year)
+		vectorFile, _ := os.Open(vectorFileName)
+		idFile, _ := os.Open(idFileName)
+		trainFile, _ := os.Open(trainFileName)
+		defer vectorFile.Close()
+		defer idFile.Close()
+		defer trainFile.Close()
+
+		// load vectors from vector file
+		vectorScanner := bufio.NewScanner(vectorFile)
+		phraseVectors := map[string][]float64{}
+		for vectorScanner.Scan() {
+			textLine := vectorScanner.Text()
+			fields := strings.Split(textLine, " ")
+			if len(fields) < 101 {
+				continue
+			}
+			phrase := fields[0]
+			phraseVector := make([]float64, 100)
+			phraseVectors[phrase] = phraseVector
+			for j := 0; j < 100; j++ {
+				phraseVector[j], _ = strconv.ParseFloat(fields[j+1], 64)
+			}
+		}
+
+		// load ids from id file
+		idScanner := bufio.NewScanner(idFile)
+		ids := []int64{}
+		for idScanner.Scan() {
+			idText := idScanner.Text()
+			id, _ := strconv.ParseInt(idText, 10, 64)
+			ids = append(ids, id)
+		}
+
+		// find high freq phrases
+		phraseFreqs := map[string]int{}
+		trainScanner := bufio.NewScanner(trainFile)
+		for trainScanner.Scan() {
+			phrases := strings.Split(trainScanner.Text(), " ")
+			for _, phrase := range phrases {
+				oldFreq, exists := phraseFreqs[phrase]
+				if !exists {
+					oldFreq = 0
+				}
+				phraseFreqs[phrase] = oldFreq + 1
+			}
+		}
+
+		highFreqPhrases := map[string]bool{}
+		for phrase, freq := range phraseFreqs {
+			if freq < minFreq {
+				continue
+			}
+			highFreqPhrases[phrase] = true
+		}
+
+		// compute phrase similarity matrix
+		phraseSimilarities := computePhraseSimilarities(phraseVectors, highFreqPhrases)
+
+		// compute ranks
+		simRanks := computeSimRanks(phraseSimilarities)
+
+		// find top jumps in phrase similarities
+		jumps := []RankJump{}
+		for phrase1, rankWithPhrase1 := range prevSimRanks {
+			for phrase2, prevRank := range rankWithPhrase1 {
+				rank := simRanks[phrase1][phrase2]
+				jump := rank - prevRank
+				if jump < minJump {
+					continue
+				}
+				jumps = append(jumps, RankJump{phrase1: phrase1, phrase2: phrase2, jump: jump})
+			}
+		}
+		sort.Slice(jumps, func(i, j int) bool {
+			return jumps[i].jump > jumps[j].jump
+		})
+
+		outputFileName := fileNamePrefix + fmt.Sprintf("-jumpranking-%d.csv", year)
+		outputFile, _ := os.Create(outputFileName)
+		defer outputFile.Close()
+		for idx, rankJump := range jumps {
+			outputFile.WriteString(fmt.Sprintf("%d, %s, %s, %d\n", idx, rankJump.phrase1, rankJump.phrase2, rankJump.jump))
+		}
+
+		// record phraseSimilarities for next round
+		prevSimRanks = simRanks
+	}
 }
